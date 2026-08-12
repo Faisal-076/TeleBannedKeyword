@@ -77,10 +77,11 @@ queues work and reads status. Never give the bot `SESSION_ENC`/`SESSION_FILE`.
 12. `Startup` command: `python -m app.main worker`.
 13. No port is needed and the worker should get **no** port. For the
     healthcheck: **disable it** (the worker process is long-running and
-    exposes no port; `watchdog`/restart-on-failure covers crashes). Health
-    of the worker is observable through the bot's `/health`:
-    `worker_heartbeat_age` reports how fresh the worker's Redis heartbeat
-    is (updated every 30 s; stale > 60 s = worker down).
+    exposes no port; `watchdog`/restart-on-failure covers crashes). Worker
+    readiness is observable through the bot's `/health` `worker` block:
+    `heartbeat_age` reports how fresh the worker's Redis heartbeat is
+    (updated every 30 s; stale > 60 s = not ready) and `mtproto_connected`
+    reports the scanner connection.
 14. **Volume** → *Add volume* → mount path **`/data`** (worker only).
     - Northflank volumes are owned by a fixed internal uid. The image user
       is pinned to **uid 10001 / gid 10001** (`useradd --uid 10001` in the
@@ -113,18 +114,20 @@ queues work and reads status. Never give the bot `SESSION_ENC`/`SESSION_FILE`.
 ## 4. Health checks & monitoring
 
 **Readiness is role-specific** (`/ready`): the bot-role app gates on DB +
-`BOT_TOKEN` configured + allowlist set; a standalone `api`-role app
-(`python -m app.main api`) gates on DB + `ADMIN_API_KEY`. The worker has no
-HTTP server — its liveness is the Redis heartbeat (`tbk:heartbeat:worker`,
-updated every 30 s), observable via the bot's `/health`
-(`worker_heartbeat_age`; stale > 60 s = worker down).
+`BOT_TOKEN` configured + allowlist set — it never depends on MTProto, so a
+fresh bot deploy is ready before any scanner session is provisioned. A
+standalone `api`-role app (`python -m app.main api`) gates on DB +
+`ADMIN_API_KEY`. The worker has no HTTP server — its readiness is published
+through the bot's `/health` `worker` block (derived from the Redis
+heartbeat `tbk:heartbeat:worker`, updated every 30 s) and the
+worker-reported MTProto state.
 
 | Service | Check | Notes |
 |---|---|---|
-| bot | HTTP `GET /health` on :8000 | liveness; `role`, `database`, `redis`, `mtproto.connected` (worker-reported), `worker_heartbeat_age`, `analysis` counts; no secrets |
-| bot | HTTP `GET /ready` | readiness: DB ok **and** bot configured; 503 otherwise |
+| bot | HTTP `GET /health` on :8000 | **liveness only**: 200 + `status: "ok"` whenever the process responds; dependency state is separate fields (`database`, `redis`, `mtproto`, `worker`, `analysis`); no secrets |
+| bot | HTTP `GET /ready` | readiness: DB ok **and** bot configured; 503 otherwise; never MTProto-dependent |
 | api (standalone) | HTTP `GET /ready` | readiness: DB ok **and** `ADMIN_API_KEY` set; 503 otherwise |
-| worker | none (portless) | liveness via heartbeat key; restart policy `ON_FAILURE` |
+| worker | none (portless) | readiness via bot `/health` `worker.ready` (heartbeat ≤ 60 s) + `worker.mtproto_connected`; restart policy `ON_FAILURE` |
 
 The bot never owns session material: it reads the scanner's connection
 state from Redis (published by the worker) and the revocation flag from

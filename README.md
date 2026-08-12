@@ -42,15 +42,17 @@ Telegram (Bot API)          Telegram (MTProto)
 └──────────────────────────────────────────────┘
 ```
 
-Two long-running services (Railway):
+Two long-running services (same Docker image, one command each):
 
 | Service    | Image command                        | Purpose                                        |
 |------------|--------------------------------------|------------------------------------------------|
-| `bot`      | `python -m app.main bot`             | aiogram polling + FastAPI (/health, admin API) |
-| `worker`   | `python -m app.main worker`          | arq worker: analysis jobs, history sync, cron  |
+| `bot`      | `python -m app.main bot`             | aiogram polling + FastAPI (/health, /ready, admin API) |
+| `worker`   | `python -m app.main worker`          | arq worker: analysis jobs, history sync, cron; **single owner of the scanner session** |
 
 PostgreSQL and Redis are required. A persistent volume (`/data`) on the
-worker service optionally holds the encrypted Telethon session file.
+worker service optionally holds the encrypted Telethon session file — the
+bot never receives session material (no `SESSION_ENC`, `SESSION_FILE` or
+`MASTER_SECRET`; it reads scanner status from worker-reported state).
 
 Full architecture diagram: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
@@ -164,29 +166,27 @@ python scripts/auth_session.py --phone +15551234567 --output session.enc
 
 ---
 
-## 7. Managed deployment (Railway / Northflank)
+## 7. Managed deployment
 
-Railway: create a project from this repository (Dockerfile), add PostgreSQL
-and Redis plugins, then two services from the same image:
+The current reference architecture runs **two services** (bot + worker)
+against **one PostgreSQL database** and **external Redis**. Northflank is
+the documented platform — follow the step-by-step guide in
+[`NORTHFLANK.md`](NORTHFLANK.md) (services, add-ons, worker-only volume,
+session provisioning, exact per-role environment, role-specific
+`/health` `/ready` semantics).
+
+The same layout maps to any Docker host (e.g. `docker-compose.yml`) or
+Railway ($`railway.toml` as base):
 
 | Service  | Start command              | Variables                              |
 |----------|----------------------------|----------------------------------------|
-| bot      | `python -m app.main bot`   | `DATABASE_URL`, `REDIS_URL`, all below |
-| worker   | `python -m app.main worker`| same                                   |
+| bot      | `python -m app.main bot`   | `DATABASE_URL`, `REDIS_URL`, `BOT_TOKEN`, `ADMIN_USER_IDS`, `ADMIN_API_KEY` |
+| worker   | `python -m app.main worker`| `DATABASE_URL`, `REDIS_URL`, `TELEGRAM_API_ID/HASH`, `MASTER_SECRET`, `SESSION_FILE` |
 
-4. Add a **volume** mounted at `/data` to the **worker only** (session file;
-   the bot never touches the scanner session).
-5. Set environment variables (see §10). All secrets as locked variables.
-6. `/health` is the healthcheck path (liveness, role-tagged); `/ready`
-   verifies DB + bot config — readiness semantics are role-specific (see
-   `NORTHFLANK.md` §4 for the API-role variant).
-
-`railway.toml` declares two services with the worker volume; treat it as the
-base and attach the plugin-generated `DATABASE_URL`/`REDIS_URL`.
-
-For **Northflank**, follow the step-by-step guide in
-[`NORTHFLANK.md`](NORTHFLANK.md) (volume uid 10001, internal hostnames,
-`rediss://` TLS Redis, startup command selection).
+- The **volume** (mounted at `/data`) belongs to the **worker only**; the
+  bot never receives session material.
+- `/health` is the healthcheck path (liveness only, role-tagged); `/ready`
+  verifies DB + process configuration and never depends on MTProto.
 
 ---
 
@@ -336,14 +336,15 @@ NEW="$(python -c "import secrets; print(secrets.token_urlsafe(32))")"
 python scripts/auth_session.py --phone +1... --master-secret "$NEW" --output session.enc
 ```
 
-Update `MASTER_SECRET` + `SESSION_ENV`/`SESSION_FILE` together on Railway. A
-stale `MASTER_SECRET` fails decryption loudly (never silently).
+Update `MASTER_SECRET` + `SESSION_ENC`/`SESSION_FILE` together on the
+deployment platform (worker env + volume). A stale `MASTER_SECRET` fails
+decryption loudly (never silently).
 
 ---
 
 ## 18. Backup and restore
 
-- **Database**: `pg_dump` the Railway Postgres plugin. Analysis data and the
+- **Database**: `pg_dump` the managed PostgreSQL add-on. Analysis data and the
   message index are included; sessions are NOT (they are never stored there).
 - **Session**: the encrypted file is the only session state. Back it up
   *encrypted* (it already is) and keep `MASTER_SECRET` OUT of the backup.

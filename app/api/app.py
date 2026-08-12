@@ -56,14 +56,25 @@ def create_app(
     @app.get("/health")
     async def health() -> dict:
         status_data = await collect_status(include_secrets=False)
+        mtproto = status_data["mtproto"]
+        heartbeat_age = status_data["worker_heartbeat_age"]
+        worker = {
+            "ready": heartbeat_age is not None and heartbeat_age <= 60,
+            "heartbeat_age": heartbeat_age,
+            "mtproto_connected": bool(mtproto["connected"]),
+            "mtproto_configured": bool(mtproto["configured"]),
+            "session_present": mtproto["session_present"],
+        }
         return {
-            "status": "ok" if status_data["database"] == "ok" else "degraded",
+            # Liveness only: a responding process is alive. Infra and
+            # dependency state are detailed below (never a 5xx here).
+            "status": "ok",
             "role": role,
             "database": status_data["database"],
             "redis": status_data["redis"],
-            "mtproto": status_data["mtproto"],
+            "mtproto": mtproto,
+            "worker": worker,
             "bot_api": status_data["bot_api"],
-            "worker_heartbeat_age": status_data["worker_heartbeat_age"],
             "analysis": status_data["analysis"],
         }
 
@@ -72,6 +83,9 @@ def create_app(
         status_data = await collect_status()
         db_ok = status_data["database"] == "ok"
         if role == "bot":
+            # Bot readiness must NOT depend on MTProto: the worker owns the
+            # scanner session and may still be bootstrapping or not yet
+            # provisioned. Only DB + bot configuration gate readiness.
             ready_ok = db_ok and status_data["bot_api"]["configured"]
         else:
             settings = get_settings()

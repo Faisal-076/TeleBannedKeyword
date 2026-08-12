@@ -76,11 +76,16 @@ def test_bot_requires_token_and_allowlist(monkeypatch):
 
 
 def test_worker_owns_mtproto():
-    """The worker process (and only it) builds the MTProto gateway."""
+    """The worker process (and only it) builds the MTProto gateway and the
+    session store."""
     from app.telegram.gateway import TelegramGateway
+    from app.telegram.session_store import SessionStore
     from app.workers import functions
 
-    assert isinstance(functions._get_gateway(), TelegramGateway)
+    gateway = functions._get_gateway()
+    assert isinstance(gateway, TelegramGateway)
+    session_store = functions._get_session_store()
+    assert isinstance(session_store, SessionStore)
 
 
 def test_worker_requires_mtproto_secrets(monkeypatch):
@@ -420,8 +425,103 @@ async def test_health_reports_role(db):
     client = TestClient(create_app(role="bot"))
     body = client.get("/health").json()
     assert body["role"] == "bot"
-    assert body["status"] in ("ok", "degraded")
-    assert "worker_heartbeat_age" in body
+    assert body["status"] == "ok"  # liveness only — never gated on infra
+    assert "database" in body
+    assert "redis" in body
+    assert "worker" in body
+    assert "heartbeat_age" in body["worker"]
 
     client_api = TestClient(create_app(role="api"))
     assert client_api.get("/health").json()["role"] == "api"
+
+
+async def test_health_liveness_ok_even_with_infra_down(db):
+    """/health must report process liveness ("ok") and surface dependency
+    state as fields even when Redis is unreachable (as in the test env)."""
+    from fastapi.testclient import TestClient
+
+    from app.api.app import create_app
+
+    body = TestClient(create_app(role="bot")).get("/health").json()
+    assert body["status"] == "ok"
+    assert body["redis"] == "error"  # conftest REDIS_URL refuses connections
+    assert body["worker"]["ready"] is False
+    assert body["worker"]["heartbeat_age"] is None
+
+
+async def test_bot_ready_does_not_require_mtproto(db, monkeypatch):
+    """Bot-role /ready must gate on DB + bot config ONLY — a bot deployment
+    works before any scanner session is provisioned."""
+    from fastapi.testclient import TestClient
+
+    from app.api.app import create_app
+
+    bot_with_no_mtproto = _settings_with(
+        telegram_api_id=0,
+        telegram_api_hash="",
+        master_secret=None,
+        session_enc=None,
+        session_file=None,
+        bot_token="123:abc",
+    )
+    monkeypatch.setattr("app.config.get_settings", lambda: bot_with_no_mtproto)
+    client = TestClient(create_app(role="bot"))
+    assert client.get("/ready").status_code == 200
+    body = client.get("/health").json()
+    assert body["mtproto"]["configured"] is False
+
+
+class _FakeRedis:
+    def __init__(self, payload: str | None):
+        self.payload = payload
+
+    async def get(self, key: str) -> str | None:
+        return { "tbk:mtproto:state": self.payload }.get(key)
+
+    async def aclose(self) -> None:
+        pass
+
+
+async def test_mtproto_status_comes_from_worker_report(db, monkeypatch):
+    """Bot/API must read mtproto configured/session state from the worker's
+    Redis report, not from their own env (which has none)."""
+    import json
+    import time
+
+    from app.services import status_service
+
+    worker_report = json.dumps(
+        {
+            "connected": True,
+            "last_connected": "2026-01-01T00:00:00+00:00",
+            "username": "@scanner",
+            "configured": True,
+            "session_present": True,
+            "reported_at": time.time(),
+        }
+    )
+    monkeypatch.setattr(status_service, "redis_available", _async_true)
+    monkeypatch.setattr(
+        "app.services.redis_client.redis_from_url",
+        lambda url, **kw: _FakeRedis(worker_report),
+    )
+
+    status = await status_service.collect_status()
+    assert status["mtproto"]["connected"] is True
+    assert status["mtproto"]["configured"] is True
+    assert status["mtproto"]["session_present"] is True
+    assert status["mtproto"]["last_connected"] == "2026-01-01T00:00:00+00:00"
+
+    # Even if the BOT's own settings claim otherwise (here: no session
+    # material at all), the worker's report is authoritative.
+    no_session_settings = _settings_with(
+        session_enc=None, session_file=None, master_secret=None
+    )
+    monkeypatch.setattr(status_service, "get_settings", lambda: no_session_settings)
+    status = await status_service.collect_status()
+    assert status["mtproto"]["session_present"] is True
+    assert status["mtproto"]["configured"] is True
+
+
+async def _async_true():
+    return True

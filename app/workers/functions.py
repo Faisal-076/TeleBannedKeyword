@@ -88,21 +88,31 @@ async def shutdown(ctx) -> None:
 
 
 async def _report_mtproto_state(connected: bool) -> None:
-    """Publish MTProto state to Redis for the bot/API status endpoints."""
+    """Publish MTProto state to Redis for the bot/API status endpoints.
+
+    configured/session_present come from the WORKER's environment and
+    session store — the only process that owns them.
+    """
     try:
         from app.services.queue import redis_available
 
         if not await redis_available():
             return
+        from app.config import get_settings
         from app.services.redis_client import redis_from_url
 
-        from app.config import get_settings
-
-        redis = redis_from_url(get_settings().redis_url, decode_responses=True)
+        settings = get_settings()
+        session_present = (await _get_session_store().load()) is not None
+        redis = redis_from_url(settings.redis_url, decode_responses=True)
         try:
             gateway = _get_gateway()
             await set_mtproto_state(
-                redis, connected, gateway.last_connected, gateway.account_username
+                redis,
+                connected,
+                gateway.last_connected,
+                gateway.account_username,
+                configured=settings.mtproto_configured,
+                session_present=session_present,
             )
         finally:
             await redis.aclose()

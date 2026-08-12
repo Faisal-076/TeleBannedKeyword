@@ -60,6 +60,10 @@ async def cmd_status(message: Message) -> None:
         worker_line = f"Worker heartbeat age: {status['worker_heartbeat_age']:.0f}s"
     else:
         worker_line = "Worker heartbeat age: n/a (worker not running)"
+    session_present = status["mtproto"]["session_present"]
+    session_label = "n/a" if session_present is None else (
+        "present" if session_present else "absent"
+    )
     text = (
         f"🖥 System status\n"
         f"Environment: {status['service']}\n"
@@ -67,7 +71,7 @@ async def cmd_status(message: Message) -> None:
         f"Redis: {status['redis']}\n"
         f"MTProto: {'CONNECTED' if status['mtproto']['connected'] else 'DISCONNECTED'}\n"
         f"  configured={status['mtproto']['configured']} "
-        f"session={status['mtproto']['session_present']}\n"
+        f"session={session_label}\n"
         f"Bot API: {'configured' if status['bot_api']['configured'] else 'not configured'}\n"
         f"{worker_line}\n"
         f"MTProto state is reported by the worker process."

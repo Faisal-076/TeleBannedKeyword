@@ -449,9 +449,9 @@ async def test_unseen_scan_keeps_real_novel_words():
 def test_bot_and_api_modules_never_reference_gateway():
     """Source-level guarantee: bot/API wiring cannot initialize MTProto.
 
-    No bot or API module may import/instantiate TelegramGateway or call
-    create_gateway — and none may use SessionStore (session material is
-    worker-only; the bot reads DB/Redis-reported state instead). Worker
+    No bot or API module may import/instantiate TelegramGateway, SessionStore
+    or TelegramClient/telethon — and none may reference session material in
+    any form (the worker owns the scanner session and its file). Worker
     modules are excluded: only the worker owns the scanner session.
     """
     import inspect
@@ -476,15 +476,25 @@ def test_bot_and_api_modules_never_reference_gateway():
         status_module,
     )
     source = "\n".join(inspect.getsource(m) for m in modules)
-    assert "TelegramGateway" not in source, (
-        "bot/API modules must not reference TelegramGateway (worker owns MTProto)"
-    )
-    assert "create_gateway" not in source, (
-        "bot/API modules must not call create_gateway (worker owns MTProto)"
-    )
-    assert "SessionStore" not in source, (
-        "bot/API modules must not reference SessionStore (session material is worker-only)"
-    )
+    for forbidden in (
+        "TelegramGateway",
+        "create_gateway",
+        "SessionStore",
+        "session_store",
+        "TelegramClient",
+        "telethon",
+        "session.enc",
+        "session_file",
+        "session_enc",
+        "master_secret",
+        "MASTER_SECRET",
+        "SESSION_FILE",
+        "SESSION_ENC",
+    ):
+        assert forbidden not in source, (
+            f"bot/API modules must not reference {forbidden!r} "
+            "(worker owns MTProto + session material)"
+        )
 
 
 async def test_main_bot_service_wiring_constructs_without_gateway(db, monkeypatch, bot_dispatcher):

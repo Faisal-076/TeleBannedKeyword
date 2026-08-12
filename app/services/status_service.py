@@ -41,9 +41,20 @@ def _heartbeat_age(redis, key: str, max_age: int = 120) -> float | None:
 
 
 async def set_mtproto_state(
-    redis, connected: bool, last_connected: datetime | None, username: str | None = None
+    redis,
+    connected: bool,
+    last_connected: datetime | None,
+    username: str | None = None,
+    *,
+    configured: bool | None = None,
+    session_present: bool | None = None,
 ) -> None:
-    """Worker-only: publish MTProto connection state for other processes."""
+    """Worker-only: publish MTProto connection state for other processes.
+
+    `configured`/`session_present` reflect the WORKER's environment (it is
+    the only process that has session material); other processes read them
+    from here instead of their own env.
+    """
     await redis.set(
         MT_PROTO_STATE_KEY,
         json.dumps(
@@ -51,6 +62,8 @@ async def set_mtproto_state(
                 "connected": bool(connected),
                 "last_connected": last_connected.isoformat() if last_connected else None,
                 "username": username,
+                "configured": configured,
+                "session_present": session_present,
                 "reported_at": time.time(),
             }
         ),
@@ -95,10 +108,12 @@ async def collect_status(
     settings = get_settings()
     redis_ok = await redis_available()
     state = await get_mtproto_state()
+    # All of these are WORKER-reported: the bot/API processes have no
+    # session material of their own (no api_id/hash, no session file).
     mtproto = {
-        "connected": state.get("connected", False),
-        "configured": settings.mtproto_configured,
-        "session_present": settings.session_configured,
+        "connected": bool(state.get("connected")),
+        "configured": state.get("configured") or False,
+        "session_present": state.get("session_present"),
         "last_connected": state.get("last_connected"),
     }
     status: dict = {
