@@ -41,8 +41,8 @@ def build_worker() -> Worker:
             heartbeat,
         ],
         cron_jobs=[
-            cron(heartbeat, second="*/30"),
-            cron(recover_queued, second="*/15"),
+            cron(heartbeat, second=set(range(0, 60, 30))),
+            cron(recover_queued, second=set(range(0, 60, 15))),
             cron(run_retention, minute=0, hour=3, run_at_startup=False),
         ],
         redis_settings=RedisSettings.from_dsn(settings.redis_url),
