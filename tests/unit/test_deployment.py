@@ -530,3 +530,67 @@ async def test_mtproto_status_comes_from_worker_report(db, monkeypatch):
 
 async def _async_true():
     return True
+
+
+async def test_health_redis_clients_are_bounded(monkeypatch):
+    """/health is the k8s liveness probe target (5s timeout, failureThreshold 3).
+    Every Redis client it builds must have socket timeouts well below that,
+    so a stalled rediss:// handshake can never hang the probe and kill the pod.
+
+    Contract: health-path clients bound connect+command to
+    HEALTH_REDIS_TIMEOUT (<=2s); they must NOT inherit unbounded defaults.
+    """
+    from app.services.redis_client import HEALTH_REDIS_TIMEOUT, redis_health_from_url
+
+    assert HEALTH_REDIS_TIMEOUT <= 2.0, "must stay below the 5s liveness probe"
+
+    seen: dict = {}
+    sentinel = object()
+
+    def _spy(url, **kwargs):
+        seen.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr("app.config.get_settings", lambda: _settings_with())
+    monkeypatch.setattr("app.services.redis_client.redis_from_url", _spy)
+
+    client = redis_health_from_url()
+    assert client is sentinel
+    # the bound applies at construction, before any command is served
+    assert seen.get("socket_timeout") == HEALTH_REDIS_TIMEOUT
+    assert seen.get("socket_connect_timeout") == HEALTH_REDIS_TIMEOUT
+    assert seen.get("decode_responses") is True
+
+
+async def test_status_service_builds_bounded_clients(monkeypatch):
+    """collect_status / get_mtproto_state must route through the bounded
+    health factory — never an unbounded redis_from_url — so /health stays
+    within the probe window even when Redis is down for 30+ seconds."""
+    import app.services.status_service as status_module
+    from app.services.redis_client import HEALTH_REDIS_TIMEOUT
+
+    calls: list[dict] = []
+
+    def _spy(url, **kwargs):
+        calls.append({"url": url, **kwargs})
+        return _FakeBoundedRedis()
+
+    class _FakeBoundedRedis:
+        async def get(self, key: str) -> str | None:
+            return None
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr(status_module, "redis_available", _async_true)
+    monkeypatch.setattr("app.services.redis_client.redis_from_url", _spy)
+
+    status = await status_module.collect_status()
+    assert status["worker_heartbeat_age"] is None
+    assert status["mtproto"]["connected"] is False
+    assert calls, "health-path Redis clients must go through the bounded factory"
+    for kwargs in calls:
+        assert kwargs["url"] == get_settings().redis_url
+        assert kwargs.get("socket_timeout") == HEALTH_REDIS_TIMEOUT
+        assert kwargs.get("socket_connect_timeout") == HEALTH_REDIS_TIMEOUT
+        assert kwargs.get("decode_responses") is True

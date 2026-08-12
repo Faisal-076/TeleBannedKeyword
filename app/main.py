@@ -14,15 +14,13 @@ _HEARTBEAT_INTERVAL = 30
 
 
 async def _bot_heartbeat_loop() -> None:
-    from app.config import get_settings
     from app.services.status_service import HEARTBEAT_BOT_KEY
 
-    settings = get_settings()
     while True:
         try:
-            from app.services.redis_client import redis_from_url
+            from app.services.redis_client import redis_health_from_url
 
-            redis = redis_from_url(settings.redis_url, decode_responses=True)
+            redis = redis_health_from_url()
             try:
                 await redis.set(HEARTBEAT_BOT_KEY, time.time(), ex=300)
             finally:

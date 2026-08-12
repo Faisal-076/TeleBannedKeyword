@@ -80,12 +80,11 @@ async def get_mtproto_state() -> dict:
         "reported_at": None,
         "available": False,
     }
-    settings = get_settings()
     if not await redis_available():
         return empty
-    from app.services.redis_client import redis_from_url
+    from app.services.redis_client import redis_health_from_url
 
-    redis = redis_from_url(settings.redis_url, decode_responses=True)
+    redis = redis_health_from_url()
     try:
         raw = await redis.get(MT_PROTO_STATE_KEY)
     finally:
@@ -130,9 +129,9 @@ async def collect_status(
         "analysis": {"queued": 0, "running": 0, "failed": 0, "total": 0},
     }
     if redis_ok:
-        from app.services.redis_client import redis_from_url
+        from app.services.redis_client import redis_health_from_url
 
-        redis = redis_from_url(settings.redis_url, decode_responses=True)
+        redis = redis_health_from_url()
         try:
             status["worker_heartbeat_age"] = await _heartbeat_age(redis, HEARTBEAT_WORKER_KEY)
             status["bot_heartbeat_age"] = await _heartbeat_age(redis, HEARTBEAT_BOT_KEY)
