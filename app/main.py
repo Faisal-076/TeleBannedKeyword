@@ -38,19 +38,17 @@ async def _run_bot_service() -> None:
     from app.database.init_db import init_db
     from app.services.analysis_service import AnalysisService
     from app.services.chat_service import ChatService
-    from app.telegram.session_store import SessionStore
 
     settings = get_settings()
     await init_db()
 
-    # The bot process NEVER opens an MTProto session. The worker is the
-    # single owner of the scanner account: it resolves chats, searches
-    # history and runs analysis jobs. The bot only queues work and reads
-    # worker-reported status from Redis.
-    session_store = SessionStore()
+    # The bot process NEVER opens an MTProto session and NEVER touches the
+    # scanner session file. The worker is the single owner of the scanner
+    # account: it resolves chats, searches history and runs analysis jobs.
+    # The bot only queues work and reads worker-reported status.
     analysis = AnalysisService()
     chat_service = ChatService()
-    dispatcher, bot = build_dispatcher(analysis, chat_service, session_store)
+    dispatcher, bot = build_dispatcher(analysis, chat_service)
     if bot is None:
         raise RuntimeError("BOT_TOKEN is required to run the bot service")
 
@@ -111,7 +109,7 @@ async def _run_api_service() -> None:
     from app.database.init_db import init_db
 
     await init_db()
-    api_app = create_app()
+    api_app = create_app(role="api")
     import uvicorn
 
     settings = get_settings()

@@ -49,8 +49,8 @@ Two long-running services (Railway):
 | `bot`      | `python -m app.main bot`             | aiogram polling + FastAPI (/health, admin API) |
 | `worker`   | `python -m app.main worker`          | arq worker: analysis jobs, history sync, cron  |
 
-PostgreSQL and Redis are required. A persistent volume (`/data`) optionally
-holds the encrypted Telethon session file.
+PostgreSQL and Redis are required. A persistent volume (`/data`) on the
+worker service optionally holds the encrypted Telethon session file.
 
 Full architecture diagram: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
@@ -177,7 +177,9 @@ and Redis plugins, then two services from the same image:
 4. Add a **volume** mounted at `/data` to the **worker only** (session file;
    the bot never touches the scanner session).
 5. Set environment variables (see §10). All secrets as locked variables.
-6. `/health` is the healthcheck path; `/ready` verifies DB + bot config.
+6. `/health` is the healthcheck path (liveness, role-tagged); `/ready`
+   verifies DB + bot config — readiness semantics are role-specific (see
+   `NORTHFLANK.md` §4 for the API-role variant).
 
 `railway.toml` declares two services with the worker volume; treat it as the
 base and attach the plugin-generated `DATABASE_URL`/`REDIS_URL`.
@@ -214,15 +216,15 @@ re-enqueues pending requests as soon as Redis is back.
 ## 10. Environment variables
 
 | Variable | Required | Default | Meaning |
-|---|---|---|---|
+|---|---|---|---|---|
 | `BOT_TOKEN` | yes (bot) | – | @BotFather token |
-| `ADMIN_USER_IDS` | yes | – | comma-separated Telegram user IDs allowed to use the bot |
-| `ADMIN_API_KEY` | yes | – | bearer token for `/api/v1/admin/*` |
-| `TELEGRAM_API_ID` | yes | – | my.telegram.org app id |
-| `TELEGRAM_API_HASH` | yes | – | my.telegram.org app hash |
-| `MASTER_SECRET` | yes (session) | – | key for session encryption |
-| `SESSION_ENC` | either | – | encrypted session blob (preferred) |
-| `SESSION_FILE` | either | – | path to encrypted session file (volume) |
+| `ADMIN_USER_IDS` | yes (bot) | – | comma-separated Telegram user IDs allowed to use the bot |
+| `ADMIN_API_KEY` | yes (bot) | – | bearer token for `/api/v1/admin/*` |
+| `TELEGRAM_API_ID` | yes (worker) | – | my.telegram.org app id |
+| `TELEGRAM_API_HASH` | yes (worker) | – | my.telegram.org app hash |
+| `MASTER_SECRET` | yes (worker, when session set) | – | key for session encryption |
+| `SESSION_ENC` | worker, either | – | encrypted session blob (preferred) |
+| `SESSION_FILE` | worker, either | – | path to encrypted session file (worker volume) |
 | `DATABASE_URL` | yes | sqlite (dev) | asyncpg URL in production |
 | `REDIS_URL` | yes | `redis://localhost:6379/0` | queue + heartbeats |
 | `MAX_MESSAGE_CHARS` | no | 4000 | hard size limit; larger drafts are rejected, never truncated |

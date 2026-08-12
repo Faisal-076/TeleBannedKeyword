@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from typing import Literal
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, status
 
@@ -33,7 +34,19 @@ async def _lifespan(app: FastAPI):
 def create_app(
     analysis: AnalysisService | None = None,
     chat_service: ChatService | None = None,
+    *,
+    role: Literal["bot", "api"] = "bot",
 ) -> FastAPI:
+    """Build the admin API application.
+
+    `role` tunes readiness semantics to the process that serves it:
+    - "bot": the app is embedded in the bot process → /ready gates on the
+      database AND the bot being configured (polling can start).
+    - "api": the app runs standalone (dev tool) → /ready gates on the
+      database AND the admin API being configured.
+    /health is role-tagged and reports infra/worker state; it never blocks
+    on other services (liveness, not readiness).
+    """
     app = FastAPI(
         title="Telegram Message Analyzer API",
         version="0.1.0",
@@ -45,6 +58,7 @@ def create_app(
         status_data = await collect_status(include_secrets=False)
         return {
             "status": "ok" if status_data["database"] == "ok" else "degraded",
+            "role": role,
             "database": status_data["database"],
             "redis": status_data["redis"],
             "mtproto": status_data["mtproto"],
@@ -57,13 +71,17 @@ def create_app(
     async def ready() -> dict:
         status_data = await collect_status()
         db_ok = status_data["database"] == "ok"
-        bot_ok = status_data["bot_api"]["configured"]
-        if not (db_ok and bot_ok):
+        if role == "bot":
+            ready_ok = db_ok and status_data["bot_api"]["configured"]
+        else:
+            settings = get_settings()
+            ready_ok = db_ok and bool(settings.admin_api_key.get_secret_value())
+        if not ready_ok:
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail={"database": status_data["database"], "bot_api": bot_ok},
+                detail={"database": status_data["database"], "role": role},
             )
-        return {"ready": True}
+        return {"ready": True, "role": role}
 
     admin = APIRouter(prefix="/api/v1/admin", tags=["admin"], dependencies=[ADMIN_DEPENDENCY])
 

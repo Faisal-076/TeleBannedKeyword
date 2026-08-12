@@ -13,12 +13,11 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 
-from app.bot.handlers import check, chats, commands
+from app.bot.handlers import chats, check, commands
 from app.bot.middleware import AuthorizationMiddleware, OperationLogMiddleware
 from app.config import get_settings
 from app.services.analysis_service import AnalysisService
 from app.services.chat_service import ChatService
-from app.telegram.session_store import SessionStore
 
 logger = logging.getLogger("app.bot.factory")
 
@@ -26,13 +25,11 @@ logger = logging.getLogger("app.bot.factory")
 def build_dispatcher(
     analysis: AnalysisService,
     chat_service: ChatService,
-    session_store: SessionStore,
 ) -> tuple[Dispatcher, Bot | None]:
     settings = get_settings()
     dispatcher = Dispatcher(storage=MemoryStorage())
     dispatcher["analysis"] = analysis
     dispatcher["chats"] = chat_service
-    dispatcher["session_store"] = session_store
     dispatcher["config"] = settings
 
     dispatcher.update.outer_middleware(AuthorizationMiddleware())

@@ -11,11 +11,11 @@ from aiogram.types import CallbackQuery, Message
 
 from app.bot.formatters import build_confirm_keyboard
 from app.config import Settings
-from app.database.models import Rule, RuleKind, RuleScope
+from app.database.models import RuleKind, RuleScope
 from app.rules import repository as rules_repo
 from app.services.queue import enqueue
+from app.services.session_state import mark_session_revoked, session_revoked
 from app.services.status_service import collect_status, get_mtproto_state
-from app.telegram.session_store import SessionStore
 
 logger = logging.getLogger("app.bot.handlers.commands")
 
@@ -205,11 +205,12 @@ async def cmd_settings(message: Message, config: Settings) -> None:
 
 
 @router.message(Command("authstatus"))
-async def cmd_authstatus(
-    message: Message, session_store: SessionStore
-) -> None:
+async def cmd_authstatus(message: Message) -> None:
+    # Session state is worker-reported: connection state comes from Redis
+    # (the worker publishes it), the revocation flag from Postgres. The bot
+    # has no session material of its own.
     state = await get_mtproto_state()
-    revoked = await session_store.is_revoked()
+    revoked = await session_revoked()
     connected = bool(state.get("connected"))
     last_connected = state.get("last_connected") or "never (no worker report yet)"
     text = (
@@ -232,9 +233,7 @@ async def cmd_logout(message: Message) -> None:
 
 
 @router.callback_query(F.data == "confirm_logout")
-async def cb_confirm_logout(
-    callback: CallbackQuery, session_store: SessionStore
-) -> None:
+async def cb_confirm_logout(callback: CallbackQuery) -> None:
     await callback.answer("Revoking…")
     queued = await enqueue("revoke_session", job_id="revoke-session")
     if queued:
@@ -243,11 +242,11 @@ async def cb_confirm_logout(
             "wipe the session file."
         )
     else:
-        # Redis is down: mark revoked in the database now; the worker
-        # refuses to reconnect once it sees the flag (and the file can be
-        # deleted from the worker volume on next start).
+        # Redis is down: mark revoked in the database now (Postgres only —
+        # the bot has no session file). The worker refuses to reconnect
+        # once it sees the flag.
         try:
-            await session_store.revoke()
+            await mark_session_revoked()
             await callback.message.answer(
                 "Session marked REVOKED (Redis unavailable — worker could "
                 "not be notified; it will refuse to reconnect)."

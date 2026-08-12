@@ -43,11 +43,10 @@ def bot_dispatcher():
     singletons and cannot be attached to a second Dispatcher."""
     from app.bot.bot_factory import build_dispatcher
 
-    dispatcher, bot = build_dispatcher(
-        AnalysisService(), ChatService(), SessionStore()
-    )
+    dispatcher, bot = build_dispatcher(AnalysisService(), ChatService())
     assert bot is None or bot.token  # just must construct
     assert "gateway" not in dispatcher.workflow_data
+    assert "session_store" not in dispatcher.workflow_data
     assert "analysis" in dispatcher.workflow_data
     assert "chats" in dispatcher.workflow_data
     return dispatcher
@@ -55,6 +54,7 @@ def bot_dispatcher():
 
 async def test_bot_dispatcher_has_no_gateway(bot_dispatcher):
     assert "gateway" not in bot_dispatcher.workflow_data
+    assert "session_store" not in bot_dispatcher.workflow_data
     assert "analysis" in bot_dispatcher.workflow_data
     assert "chats" in bot_dispatcher.workflow_data
 
@@ -450,8 +450,9 @@ def test_bot_and_api_modules_never_reference_gateway():
     """Source-level guarantee: bot/API wiring cannot initialize MTProto.
 
     No bot or API module may import/instantiate TelegramGateway or call
-    create_gateway. (Worker modules are excluded: only the worker owns the
-    scanner session.)
+    create_gateway — and none may use SessionStore (session material is
+    worker-only; the bot reads DB/Redis-reported state instead). Worker
+    modules are excluded: only the worker owns the scanner session.
     """
     import inspect
 
@@ -481,6 +482,9 @@ def test_bot_and_api_modules_never_reference_gateway():
     assert "create_gateway" not in source, (
         "bot/API modules must not call create_gateway (worker owns MTProto)"
     )
+    assert "SessionStore" not in source, (
+        "bot/API modules must not reference SessionStore (session material is worker-only)"
+    )
 
 
 async def test_main_bot_service_wiring_constructs_without_gateway(db, monkeypatch, bot_dispatcher):
@@ -505,7 +509,7 @@ async def test_main_bot_service_wiring_constructs_without_gateway(db, monkeypatc
     # `bot_dispatcher` fixture — here we prove main.py's wiring around it.
     monkeypatch.setattr(
         bot_factory, "build_dispatcher",
-        lambda analysis, chat_service, session_store: (bot_dispatcher, object()),
+        lambda analysis, chat_service: (bot_dispatcher, object()),
     )
     monkeypatch.setattr(bot_factory, "start_bot_polling", _noop_polling)
     monkeypatch.setattr(uvicorn.Server, "serve", _noop)

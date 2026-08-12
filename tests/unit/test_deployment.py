@@ -352,3 +352,76 @@ async def test_redis_failure_does_not_make_bot_mtproto_owner(db, monkeypatch):
 
 async def _async_none():
     return None
+
+
+# ----------------------------------------- bot without SessionStore/volume
+
+
+async def test_bot_session_state_db_only(db, monkeypatch):
+    """The bot reads/writes session state via Postgres only — no session
+    env, no session file, no master secret anywhere in the bot process."""
+    import app.telegram.session_store as session_store_module
+    from app.services import session_state
+
+    no_session_settings = _settings_with(
+        session_enc=None,
+        session_file=None,
+        master_secret=None,
+    )
+    monkeypatch.setattr(session_store_module, "get_settings", lambda: no_session_settings)
+
+    assert await session_state.session_revoked() is False
+
+    await session_state.mark_session_revoked()
+    assert await session_state.session_revoked() is True
+
+    # The worker's SessionStore must agree (same app_state key): the worker
+    # refuses to connect while the bot-side flag is set.
+    from app.telegram.session_store import SessionStore
+
+    assert await SessionStore().is_revoked() is True
+
+    # Clearing the flag (re-provisioning, as done by tbk-auth locally)
+    # restores a non-revoked state the bot observes.
+    async with session_state.session_scope() as session:
+        state = await session.get(session_state.AppState, session_state.SESSION_STATE_KEY)
+        assert state is not None
+        state.value = {**state.value, "revoked": False}
+    assert await session_state.session_revoked() is False
+
+
+async def test_ready_api_role_gates_on_admin_key(db, monkeypatch):
+    """Standalone API (/ready) must gate on DB + ADMIN_API_KEY, not on
+    bot configuration (it has none)."""
+    from fastapi.testclient import TestClient
+
+    from app.api.app import create_app
+
+    client = TestClient(create_app(role="api"))
+    # conftest env provides ADMIN_API_KEY + DATABASE_URL → ready.
+    assert client.get("/ready").status_code == 200
+
+    import app.api.app as api_app_module
+
+    monkeypatch.setattr(
+        api_app_module, "get_settings",
+        lambda: _settings_with(admin_api_key=""),
+    )
+    client2 = TestClient(create_app(role="api"))
+    assert client2.get("/ready").status_code == 503
+
+
+async def test_health_reports_role(db):
+    """/health is role-tagged liveness; it never 503s for infra peers."""
+    from fastapi.testclient import TestClient
+
+    from app.api.app import create_app
+
+    client = TestClient(create_app(role="bot"))
+    body = client.get("/health").json()
+    assert body["role"] == "bot"
+    assert body["status"] in ("ok", "degraded")
+    assert "worker_heartbeat_age" in body
+
+    client_api = TestClient(create_app(role="api"))
+    assert client_api.get("/health").json()["role"] == "api"

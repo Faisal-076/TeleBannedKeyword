@@ -112,15 +112,27 @@ queues work and reads status. Never give the bot `SESSION_ENC`/`SESSION_FILE`.
 
 ## 4. Health checks & monitoring
 
+**Readiness is role-specific** (`/ready`): the bot-role app gates on DB +
+`BOT_TOKEN` configured + allowlist set; a standalone `api`-role app
+(`python -m app.main api`) gates on DB + `ADMIN_API_KEY`. The worker has no
+HTTP server — its liveness is the Redis heartbeat (`tbk:heartbeat:worker`,
+updated every 30 s), observable via the bot's `/health`
+(`worker_heartbeat_age`; stale > 60 s = worker down).
+
 | Service | Check | Notes |
 |---|---|---|
-| bot | HTTP `GET /health` on :8000 | `database`, `redis`, `mtproto.connected`, `worker_heartbeat_age`, `analysis` queue counts; no secrets |
-| bot | `GET /ready` | readiness: DB reachable + config present |
-| worker | none (portless) | monitor via bot `/health` → `worker_heartbeat_age`; restart policy `ON_FAILURE` |
+| bot | HTTP `GET /health` on :8000 | liveness; `role`, `database`, `redis`, `mtproto.connected` (worker-reported), `worker_heartbeat_age`, `analysis` counts; no secrets |
+| bot | HTTP `GET /ready` | readiness: DB ok **and** bot configured; 503 otherwise |
+| api (standalone) | HTTP `GET /ready` | readiness: DB ok **and** `ADMIN_API_KEY` set; 503 otherwise |
+| worker | none (portless) | liveness via heartbeat key; restart policy `ON_FAILURE` |
 
-Both replicas of the same service are fine: migrations are serialized by a
-**Postgres advisory lock** in `migrations/env.py` (a second replicas'
-`alembic upgrade head` waits, then no-ops), and the DB schema is shared.
+The bot never owns session material: it reads the scanner's connection
+state from Redis (published by the worker) and the revocation flag from
+Postgres (`app/services/session_state.py`) — no `SESSION_ENC`/`SESSION_FILE`
+env and no session volume are ever given to the bot service. Replicas of
+the same service are fine: migrations are serialized by a **Postgres
+advisory lock** in `migrations/env.py` (a second replica's `alembic upgrade
+head` waits, then no-ops), and the DB schema is shared.
 
 ## 5. Environment variables for Northflank
 
