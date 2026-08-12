@@ -53,6 +53,11 @@ async def run_migrations_online() -> None:
                     text("SELECT pg_advisory_lock(hashtext(:k))"),
                     {"k": _MIGRATION_LOCK_KEY},
                 )
+                # The lock SELECT auto-begins a transaction on this connection.
+                # Commit it so alembic owns a fresh migration transaction below;
+                # otherwise alembic reuses the dangling transaction and the
+                # whole migration is rolled back when the engine disposes.
+                await connection.commit()
             try:
                 await connection.run_sync(do_run_migrations)
             finally:
@@ -61,6 +66,7 @@ async def run_migrations_online() -> None:
                         text("SELECT pg_advisory_unlock(hashtext(:k))"),
                         {"k": _MIGRATION_LOCK_KEY},
                     )
+                    await connection.commit()
     finally:
         await engine.dispose()
 
