@@ -20,7 +20,6 @@ from app.config import get_settings
 from app.database.engine import check_database, session_scope
 from app.database.models import AnalysisRequest
 from app.services.queue import redis_available
-from app.telegram.gateway import TelegramGateway
 
 logger = logging.getLogger("app.services.status")
 
@@ -89,30 +88,19 @@ async def get_mtproto_state() -> dict:
 
 
 async def collect_status(
-    gateway: TelegramGateway | None,
     bot_connected: bool | None = None,
     *,
     include_secrets: bool = False,
 ) -> dict:
     settings = get_settings()
     redis_ok = await redis_available()
-    if gateway is not None:
-        mtproto = {
-            "connected": bool(gateway.connected),
-            "configured": settings.mtproto_configured,
-            "session_present": settings.session_configured,
-            "last_connected": gateway.last_connected.isoformat()
-            if gateway.last_connected
-            else None,
-        }
-    else:
-        state = await get_mtproto_state()
-        mtproto = {
-            "connected": state.get("connected", False),
-            "configured": settings.mtproto_configured,
-            "session_present": settings.session_configured,
-            "last_connected": state.get("last_connected"),
-        }
+    state = await get_mtproto_state()
+    mtproto = {
+        "connected": state.get("connected", False),
+        "configured": settings.mtproto_configured,
+        "session_present": settings.session_configured,
+        "last_connected": state.get("last_connected"),
+    }
     status: dict = {
         "service": settings.environment,
         "database": "ok" if await check_database() else "error",

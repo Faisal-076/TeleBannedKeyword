@@ -31,9 +31,15 @@ class SessionStore:
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
 
     async def load(self) -> str | None:
-        """Return the decrypted session string (memory-only), or None."""
+        """Return the decrypted session string (memory-only), or None.
+
+        A `None` result is never cached: after `/logout` wipes the file, a
+        freshly provisioned session (new `SESSION_FILE` / `SESSION_ENC` +
+        cleared revoked flag) is picked up on the next call without needing a
+        worker restart (revoke -> re-provision transition).
+        """
         async with self._lock:
-            if self._loaded:
+            if self._loaded and self._plaintext is not None:
                 return self._plaintext
             self._plaintext = await asyncio.to_thread(self._read_from_secrets)
             self._loaded = True

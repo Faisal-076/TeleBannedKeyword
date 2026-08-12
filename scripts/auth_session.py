@@ -110,6 +110,19 @@ async def _run(args) -> int:
         username = getattr(me, "username", None) or f"id{me.id}"
         phone = mask_phone(getattr(me, "phone", "") or "")
         print(f"Authenticated as @{mask_username(username)} (phone {phone})")
+
+        # Complete the revoke -> re-provision transition: if a previous
+        # /logout marked the session revoked, the new session must clear the
+        # flag before the worker will reconnect. Best-effort: when this
+        # script runs off-server (no shared DB), skip silently.
+        try:
+            from app.telegram.session_store import SessionStore
+
+            await SessionStore().unrevoke()
+        except Exception:  # noqa: BLE001
+            print("Note: could not reach the server database to clear the "
+                  "revoked flag; clear it after deploying the new session.")
+
         if args.output:
             path = args.output
             directory = os.path.dirname(os.path.abspath(path)) or "."

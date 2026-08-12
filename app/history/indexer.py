@@ -72,13 +72,24 @@ class HistoryIndexer:
             if mode == "incremental":
                 limit_total = 0
             cursor = chat.sync_cursor or 0
-            max_id = cursor + limit_total if limit_total else None
+            total_processed = 0
 
             while True:
+                # The cap is a COUNT of messages, never a message-ID offset:
+                # Telegram ids are not contiguous, so `cursor + limit` is
+                # meaningless. Same for the estimate (a count, not an id).
+                remaining = limit_total - total_processed if limit_total else None
+                if remaining is not None and remaining <= 0:
+                    break
+                page_limit = (
+                    min(self._settings.incremental_sync_batch, remaining)
+                    if remaining is not None
+                    else self._settings.incremental_sync_batch
+                )
                 page = await self._gateway.iter_messages(
                     chat.telegram_chat_id,
                     min_id=cursor,
-                    limit=self._settings.incremental_sync_batch,
+                    limit=page_limit,
                     topic_id=chat.topic_id,
                 )
                 if not page:
@@ -87,23 +98,21 @@ class HistoryIndexer:
                 created = await self._store_page(chat, page)
                 report.processed += len(page)
                 report.new_messages += created
+                total_processed += len(page)
                 cursor = max(h.message_id for h in page)
                 await self._persist_cursor(chat, cursor)
-                if max_id and cursor >= max_id:
-                    break
-                if max_id is None and estimate and cursor >= estimate:
-                    break
 
-            await self._persist_done(chat)
+            if report.end_reached:
+                await self._persist_done(chat)
+            else:
+                coverage = compute_coverage(chat)
+                await self._persist_partial(chat, coverage.note)
+                chat.sync_state = SyncState.PARTIAL.value
+                report.error = coverage.note
             logger.info(
                 "history: sync complete chat=%s mode=%s processed=%d new=%d",
                 chat.telegram_chat_id, mode, report.processed, report.new_messages,
             )
-            if not report.end_reached:
-                coverage = compute_coverage(chat)
-                chat.sync_state = SyncState.PARTIAL.value
-                chat.sync_error = coverage.note
-                report.error = coverage.note
             return report
         except TelegramAccessError as exc:
             chat.sync_state = SyncState.FAILED.value
@@ -227,6 +236,18 @@ class HistoryIndexer:
             row = await session.get(TargetChat, chat.id)
             if row is not None:
                 row.sync_estimate = estimate
+
+    async def _persist_partial(self, chat: TargetChat, note: str | None) -> None:
+        async with session_scope() as session:
+            row = await session.get(TargetChat, chat.id)
+            if row is not None:
+                row.sync_state = SyncState.PARTIAL.value
+                row.sync_error = note
+                row.sync_at = utc_now_naive()
+                count_result = await session.execute(
+                    select(IndexedMessage.id).where(IndexedMessage.chat_id == row.telegram_chat_id)
+                )
+                row.sync_indexed_count = len(list(count_result.all()))
 
     async def _persist_done(self, chat: TargetChat) -> None:
         async with session_scope() as session:

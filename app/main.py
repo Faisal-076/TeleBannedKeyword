@@ -59,7 +59,7 @@ async def _run_bot_service() -> None:
     # API server + polling run in the same process (Railway service 1).
     from app.api.app import create_app
 
-    api_app = create_app(gateway=None, analysis=analysis, chat_service=chat_service)
+    api_app = create_app(analysis=analysis, chat_service=chat_service)
 
     async def _serve_api() -> None:
         import uvicorn
@@ -107,7 +107,7 @@ async def _run_api_service() -> None:
     from app.database.init_db import init_db
 
     await init_db()
-    api_app = create_app(gateway=None)
+    api_app = create_app()
     import uvicorn
 
     settings = get_settings()

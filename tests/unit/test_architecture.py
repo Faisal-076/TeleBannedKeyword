@@ -37,7 +37,10 @@ async def _noop_notify(*args, **kwargs):
 # ---------------------------------------------------------------- bot isolation
 
 
-async def test_bot_dispatcher_has_no_gateway():
+@pytest.fixture(scope="session")
+def bot_dispatcher():
+    """One dispatcher for the whole session: aiogram routers are module
+    singletons and cannot be attached to a second Dispatcher."""
     from app.bot.bot_factory import build_dispatcher
 
     dispatcher, bot = build_dispatcher(
@@ -47,6 +50,13 @@ async def test_bot_dispatcher_has_no_gateway():
     assert "gateway" not in dispatcher.workflow_data
     assert "analysis" in dispatcher.workflow_data
     assert "chats" in dispatcher.workflow_data
+    return dispatcher
+
+
+async def test_bot_dispatcher_has_no_gateway(bot_dispatcher):
+    assert "gateway" not in bot_dispatcher.workflow_data
+    assert "analysis" in bot_dispatcher.workflow_data
+    assert "chats" in bot_dispatcher.workflow_data
 
 
 async def test_bot_analysis_service_runs_without_gateway(db):
@@ -110,7 +120,7 @@ async def test_api_never_creates_mtproto(db, monkeypatch):
 
     monkeypatch.setattr("app.api.app.create_gateway", _boom, raising=False)
     monkeypatch.setattr("app.api.app.enqueue", _fake_enqueue)
-    app = create_app(gateway=None)
+    app = create_app()
     client = TestClient(app)
     headers = {"Authorization": "Bearer test-admin-key-secret"}
     assert client.get("/api/v1/admin/chats", headers=headers).status_code == 200
@@ -126,7 +136,7 @@ async def test_api_never_creates_mtproto(db, monkeypatch):
 async def test_api_status_does_not_need_gateway(db):
     from app.services.status_service import collect_status
 
-    status = await collect_status(None)
+    status = await collect_status()
     assert status["database"] in ("ok", "error")
     assert status["redis"] == "error"
     assert status["mtproto"]["connected"] is False
@@ -268,7 +278,7 @@ def test_classify_session_expired():
 
 
 async def test_call_maps_session_expired_and_network():
-    from telethon.errors import AuthKeyUnregisteredError, UnauthorizedError
+    from telethon.errors import AuthKeyUnregisteredError
 
     gateway = TelegramGateway(SessionStore())
     gateway._client = object()
@@ -354,9 +364,10 @@ async def test_worker_add_chat_private_invite_refuses(db, fake_gateway, monkeypa
     assert result["ok"] is False
     assert result["error"] == "private_no_access"
 
+    from sqlalchemy import select
+
     from app.database.engine import session_scope
     from app.database.models import TargetChat
-    from sqlalchemy import select
 
     async with session_scope() as session:
         rows = (await session.execute(select(TargetChat))).scalars().all()
@@ -400,7 +411,6 @@ async def test_unseen_scan_skips_codes_mentions_and_urls():
     from app.analysis.normalize import normalize_document
     from app.analysis.pipeline import AnalysisPipeline
 
-    deps = object()
     pipeline = AnalysisPipeline.__new__(AnalysisPipeline)
     doc = normalize_document(
         "code #hash123 @mention example.com check https://x.io/ab"
@@ -431,6 +441,251 @@ async def test_unseen_scan_keeps_real_novel_words():
     terms = {f.term for f in findings}
     assert "quasimodo" in terms
     assert all(f.evidence == EvidenceType.UNSEEN for f in findings)
+
+
+# ------------------------------------------- worker-only MTProto (regressions)
+
+
+def test_bot_and_api_modules_never_reference_gateway():
+    """Source-level guarantee: bot/API wiring cannot initialize MTProto.
+
+    No bot or API module may import/instantiate TelegramGateway or call
+    create_gateway. (Worker modules are excluded: only the worker owns the
+    scanner session.)
+    """
+    import inspect
+
+    import app.bot.bot_factory as factory_module
+    import app.bot.handlers.chats as chats_module
+    import app.bot.handlers.check as check_module
+    import app.bot.handlers.commands as commands_module
+    import app.main as main_module
+    import app.services.chat_service as chat_service_module
+    import app.services.status_service as status_module
+    from app import api
+
+    modules = (
+        api.app,
+        factory_module,
+        check_module,
+        chats_module,
+        commands_module,
+        main_module,
+        chat_service_module,
+        status_module,
+    )
+    source = "\n".join(inspect.getsource(m) for m in modules)
+    assert "TelegramGateway" not in source, (
+        "bot/API modules must not reference TelegramGateway (worker owns MTProto)"
+    )
+    assert "create_gateway" not in source, (
+        "bot/API modules must not call create_gateway (worker owns MTProto)"
+    )
+
+
+async def test_main_bot_service_wiring_constructs_without_gateway(db, monkeypatch, bot_dispatcher):
+    """`python -m app.main bot` wiring: DB, dispatcher, services, API app,
+    API server and polling all construct with NO MTProto gateway anywhere."""
+    import uvicorn
+
+    import app.main as main_module
+    from app.bot import bot_factory
+
+    async def _noop(*args, **kwargs):
+        return None
+
+    calls: list[str] = []
+
+    async def _noop_polling(dispatcher, bot):
+        calls.append("polling")
+        return None
+
+    # aiogram routers are already attached to `bot_dispatcher`; re-building
+    # would raise. The real `build_dispatcher` is exercised once by the
+    # `bot_dispatcher` fixture — here we prove main.py's wiring around it.
+    monkeypatch.setattr(
+        bot_factory, "build_dispatcher",
+        lambda analysis, chat_service, session_store: (bot_dispatcher, object()),
+    )
+    monkeypatch.setattr(bot_factory, "start_bot_polling", _noop_polling)
+    monkeypatch.setattr(uvicorn.Server, "serve", _noop)
+
+    await main_module._run_bot_service()
+
+    assert calls == ["polling"]
+
+
+async def test_main_api_service_wiring_constructs_without_gateway(db, monkeypatch):
+    """`python -m app.main api` wiring: DB + API app, no gateway."""
+    import uvicorn
+
+    import app.main as main_module
+
+    async def _noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(uvicorn.Server, "serve", _noop)
+    await main_module._run_api_service()
+
+
+async def test_session_revoke_then_reprovision_transition(db, monkeypatch, tmp_path):
+    """/logout → revoked flag set + file wiped + connect refused; a freshly
+    provisioned session + unrevoke restores loadability (no worker restart)."""
+    import app.telegram.session_store as session_store_module
+    from app.config import get_settings
+    from app.telegram.gateway import TelegramGateway
+    from app.telegram.session_store import SessionStore
+
+    session_file = tmp_path / "session.enc"
+    patched = get_settings().model_copy(
+        update={"session_file": str(session_file), "session_enc": None}
+    )
+    monkeypatch.setattr(session_store_module, "get_settings", lambda: patched)
+
+    session_string_one = "1AAfake_session_string_one"
+    session_string_two = "1AAfake_session_string_two"
+    store = SessionStore()
+    await store.save_new_session(session_string_one)
+    assert await store.load() == session_string_one
+
+    await store.revoke()
+    assert await store.is_revoked() is True
+    assert not session_file.exists()
+    assert await store.load() is None
+
+    # The worker refuses to connect while the session is revoked.
+    gateway = TelegramGateway(store)
+    assert await gateway.connect() is False
+
+    # Re-provision: new session saved + flag cleared → loadable again.
+    await store.save_new_session(session_string_two)
+    await store.unrevoke()
+    assert await store.is_revoked() is False
+    fresh = SessionStore()
+    assert await fresh.load() == session_string_two
+
+
+# ------------------------------------------------ history sync stop conditions
+
+
+async def test_sync_initial_caps_at_message_count_not_ids(db):
+    """Initial sync must stop after N MESSAGES (not `cursor + N` as a
+    message-ID threshold). Non-contiguous ids prove the count-based cap."""
+    from datetime import UTC, datetime
+
+    from app.config import get_settings
+    from app.database.engine import session_scope
+    from app.database.models import SyncState, TargetChat
+    from app.history.indexer import HistoryIndexer
+    from tests.conftest import FakeMessage
+
+    ids = [1000 + i * 7 for i in range(9)]
+    settings = get_settings()
+    settings.initial_sync_max_messages = 5
+
+    class _SparseGateway:
+        def __init__(self) -> None:
+            self.pages: list[int] = []
+
+        async def estimate_total(self, chat_id: int) -> int:
+            return 10_000  # deliberately far larger than any message id
+
+        async def iter_messages(self, chat_id: int, *, min_id=None, limit=500, topic_id=None):
+            self.pages.append(limit)
+            page = [
+                FakeMessage(message_id=i,
+                    date=datetime(2025, 1, 1, tzinfo=UTC),
+                    text=f"message body {i}",
+                )
+                for i in ids
+                if i > (min_id or 0)
+            ]
+            return page[:limit]
+
+    async with session_scope() as session:
+        chat = TargetChat(
+            telegram_chat_id=-100444001, title="cap test", chat_type="group"
+        )
+        session.add(chat)
+        await session.flush()
+        pk = chat.id
+
+    from sqlalchemy import select
+
+    async with session_scope() as session:
+        chat = (await session.execute(select(TargetChat).where(TargetChat.id == pk))).scalar_one()
+
+    gateway = _SparseGateway()
+    report = await HistoryIndexer(gateway).sync_chat(chat, "initial")
+    assert report.processed == 5, "cap must count messages, not compare ids"
+    assert report.new_messages == 5
+    assert report.end_reached is False
+    assert gateway.pages == [5]
+
+    async with session_scope() as session:
+        row = await session.get(TargetChat, pk)
+        assert row is not None
+        assert row.sync_cursor == max(ids[:5])
+        assert row.sync_state == SyncState.PARTIAL.value
+
+    settings.initial_sync_max_messages = 200_000
+
+
+async def test_sync_incremental_ignores_estimate_and_runs_to_end(db):
+    """Incremental sync must run until history is exhausted; the estimate
+    (a COUNT) must never be compared against message IDs (sparse ids far
+    above the estimate prove it)."""
+    from datetime import UTC, datetime
+
+    from app.database.engine import session_scope
+    from app.database.models import SyncState, TargetChat
+    from app.history.indexer import HistoryIndexer
+    from tests.conftest import FakeMessage
+
+    ids = [1000 + i * 7 for i in range(9)]
+
+    class _TinyGateway:
+        def __init__(self) -> None:
+            self.pages: list[int] = []
+
+        async def estimate_total(self, chat_id: int) -> int:
+            return 5  # count, far below every message id
+
+        async def iter_messages(self, chat_id: int, *, min_id=None, limit=500, topic_id=None):
+            self.pages.append(limit)
+            page = [
+                FakeMessage(message_id=i,
+                    date=datetime(2025, 1, 1, tzinfo=UTC),
+                    text=f"message body {i}",
+                )
+                for i in ids
+                if i > (min_id or 0)
+            ]
+            return page[:limit]
+
+    async with session_scope() as session:
+        chat = TargetChat(
+            telegram_chat_id=-100444002, title="run-to-end test", chat_type="group"
+        )
+        session.add(chat)
+        await session.flush()
+        pk = chat.id
+
+    from sqlalchemy import select
+
+    async with session_scope() as session:
+        chat = (await session.execute(select(TargetChat).where(TargetChat.id == pk))).scalar_one()
+
+    gateway = _TinyGateway()
+    report = await HistoryIndexer(gateway).sync_chat(chat, "incremental")
+    assert report.processed == len(ids)
+    assert report.end_reached is True
+
+    async with session_scope() as session:
+        row = await session.get(TargetChat, pk)
+        assert row is not None
+        assert row.sync_cursor == ids[-1]
+        assert row.sync_state == SyncState.DONE.value
 
 
 CHAT_ID = -100777

@@ -28,7 +28,7 @@ class _ResolvedChat:
 
 def _client(fake_gateway: FakeGateway) -> TestClient:
     chat_service = ChatService()
-    app = create_app(gateway=None, chat_service=chat_service)
+    app = create_app(chat_service=chat_service)
     return TestClient(app)
 
 

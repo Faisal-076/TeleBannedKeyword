@@ -7,6 +7,7 @@ background asyncio tasks so the bot keeps working in degraded mode.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 
 from arq import create_pool
@@ -20,11 +21,25 @@ _pool = None
 _pool_task: asyncio.Task | None = None
 
 
+def _bot_api_redis_settings() -> RedisSettings:
+    """Bot/API pool: fail fast when Redis is down.
+
+    The worker builds its own pool with retries (it must survive Redis
+    coming up late); the bot/API processes must degrade quickly — every
+    `enqueue`/`redis_available` call would otherwise stall ~6s on arq's
+    default 5 retries.
+    """
+    return dataclasses.replace(
+        RedisSettings.from_dsn(get_settings().redis_url),
+        conn_retries=0,
+        conn_timeout=1,
+    )
+
+
 async def _get_pool():
     global _pool, _pool_task
     if _pool is None:
-        settings = get_settings()
-        redis_settings = RedisSettings.from_dsn(settings.redis_url)
+        redis_settings = _bot_api_redis_settings()
         if _pool_task is None:
             async def _connect():
                 global _pool

@@ -17,7 +17,7 @@ from app.database.engine import session_scope
 from app.database.models import AuditEvent, TargetChat
 from app.security.redact import mask_username
 from app.telegram.errors import AccessState
-from app.telegram.gateway import ResolvedChat, TelegramGateway
+from app.telegram.gateway import ResolvedChat
 from app.utils.timeutil import utc_now_naive
 
 logger = logging.getLogger("app.services.chats")
@@ -32,10 +32,11 @@ class AddChatResult:
 
 
 class ChatService:
-    def __init__(self, gateway: TelegramGateway | None = None) -> None:
-        # `gateway` is accepted for backward compatibility only; all MTProto
-        # work has moved to worker jobs. Nothing here touches MTProto.
-        self._gateway = gateway
+    """Database-only chat management; never touches MTProto.
+
+    Resolution/verification happens in the worker (`add_chat` / `check_chat`
+    jobs); this service only persists what the worker resolved.
+    """
 
     async def persist_resolved(self, resolved: ResolvedChat, actor: str) -> AddChatResult:
         """Persist a chat that the worker already resolved via MTProto."""

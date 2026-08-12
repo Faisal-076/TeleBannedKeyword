@@ -21,7 +21,6 @@ from app.services.analysis_service import AnalysisService
 from app.services.chat_service import ChatService
 from app.services.queue import enqueue
 from app.services.status_service import collect_status
-from app.telegram.gateway import TelegramGateway
 
 logger = logging.getLogger("app.api")
 
@@ -32,7 +31,6 @@ async def _lifespan(app: FastAPI):
 
 
 def create_app(
-    gateway: TelegramGateway | None,
     analysis: AnalysisService | None = None,
     chat_service: ChatService | None = None,
 ) -> FastAPI:
@@ -44,7 +42,7 @@ def create_app(
 
     @app.get("/health")
     async def health() -> dict:
-        status_data = await collect_status(gateway, include_secrets=False)
+        status_data = await collect_status(include_secrets=False)
         return {
             "status": "ok" if status_data["database"] == "ok" else "degraded",
             "database": status_data["database"],
@@ -57,7 +55,7 @@ def create_app(
 
     @app.get("/ready")
     async def ready() -> dict:
-        status_data = await collect_status(gateway)
+        status_data = await collect_status()
         db_ok = status_data["database"] == "ok"
         bot_ok = status_data["bot_api"]["configured"]
         if not (db_ok and bot_ok):
@@ -176,7 +174,7 @@ def create_app(
 
     @admin.get("/status")
     async def admin_status() -> dict:
-        return await collect_status(gateway, include_secrets=False)
+        return await collect_status(include_secrets=False)
 
     app.include_router(admin)
     return app
