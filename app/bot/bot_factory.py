@@ -32,8 +32,12 @@ def build_dispatcher(
     dispatcher["chats"] = chat_service
     dispatcher["config"] = settings
 
-    dispatcher.update.outer_middleware(AuthorizationMiddleware())
-    dispatcher.update.outer_middleware(OperationLogMiddleware())
+    # These middlewares authorize/log Message and CallbackQuery events.  They
+    # must be attached to those observers, rather than ``update`` where
+    # aiogram supplies an Update wrapper with no direct ``from_user``.
+    for observer in (dispatcher.message, dispatcher.callback_query):
+        observer.outer_middleware(AuthorizationMiddleware())
+        observer.outer_middleware(OperationLogMiddleware())
 
     dispatcher.include_router(commands.router)
     dispatcher.include_router(chats.router)

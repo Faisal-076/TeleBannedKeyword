@@ -59,6 +59,16 @@ async def test_bot_dispatcher_has_no_gateway(bot_dispatcher):
     assert "chats" in bot_dispatcher.workflow_data
 
 
+async def test_bot_dispatcher_authorizes_message_and_callback_events(bot_dispatcher):
+    """Auth middleware must receive events with a direct ``from_user``."""
+    from app.bot.middleware import AuthorizationMiddleware, OperationLogMiddleware
+
+    for observer in (bot_dispatcher.message, bot_dispatcher.callback_query):
+        middlewares = observer.outer_middleware._middlewares
+        assert any(isinstance(item, AuthorizationMiddleware) for item in middlewares)
+        assert any(isinstance(item, OperationLogMiddleware) for item in middlewares)
+
+
 async def test_bot_analysis_service_runs_without_gateway(db):
     """Bot submits with NO MTProto gateway; no inline execution happens."""
     service = AnalysisService()
