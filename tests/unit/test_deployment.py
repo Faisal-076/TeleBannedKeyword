@@ -229,13 +229,18 @@ def test_external_redis_url_supported(tmp_path, monkeypatch):
 
     client = redis_from_url(settings.redis_url)
     assert client.connection_pool.connection_kwargs["host"] == "redis.internal.prod"
-    assert client.connection_pool.connection_kwargs["ssl"] is True
-    # redis-py's plain from_url() silently drops TLS for rediss:// — the
-    # helper must be what the app uses, not bare from_url.
+    # redis-py >=5 maps rediss:// to SSLConnection — a rediss client must be
+    # TLS-capable, and hostname verification must be on by default.
+    from redis.asyncio.connection import SSLConnection
+
+    assert client.connection_pool.connection_class is SSLConnection
+    assert client.connection_pool.connection_kwargs["ssl_check_hostname"] is True
+    # Passing the legacy `ssl=True` kwarg to from_url() is rejected by
+    # redis-py >=5 asyncio connections; the helper must not inject it.
     from redis.asyncio import from_url
 
     plain = from_url(settings.redis_url)
-    assert "ssl" not in plain.connection_pool.connection_kwargs  # regression proof
+    assert plain.connection_pool.connection_class is SSLConnection  # rediss -> TLS
 
     monkeypatch.setattr(
         "app.services.queue.get_settings", lambda: settings
