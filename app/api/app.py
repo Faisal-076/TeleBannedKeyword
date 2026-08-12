@@ -56,7 +56,13 @@ def create_app(
     @app.get("/health")
     async def health() -> dict:
         status_data = await collect_status(include_secrets=False)
-        mtproto = status_data["mtproto"]
+        mtproto_raw = status_data["mtproto"]
+        mtproto = {
+            "connected": bool(mtproto_raw["connected"]),
+            "configured": mtproto_raw.get("configured") or False,
+            "session_present": mtproto_raw.get("session_present"),
+            "last_connected": mtproto_raw.get("last_connected"),
+        }
         heartbeat_age = status_data["worker_heartbeat_age"]
         worker = {
             "ready": heartbeat_age is not None and heartbeat_age <= 60,

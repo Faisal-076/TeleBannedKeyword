@@ -10,6 +10,7 @@ context.
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -594,3 +595,303 @@ async def test_status_service_builds_bounded_clients(monkeypatch):
         assert kwargs.get("socket_timeout") == HEALTH_REDIS_TIMEOUT
         assert kwargs.get("socket_connect_timeout") == HEALTH_REDIS_TIMEOUT
         assert kwargs.get("decode_responses") is True
+
+
+# ----------------------------------------------------------- session presence
+
+
+def _fake_mtproto_redis(payload: str | None):
+    class _R:
+        async def get(self, key: str) -> str | None:
+            return payload
+
+        async def aclose(self) -> None:
+            pass
+
+    return _R()
+
+
+def _patch_redis(monkeypatch, payload: str | None):
+    import app.services.status_service as status_service
+
+    monkeypatch.setattr(status_service, "redis_available", _async_true)
+    monkeypatch.setattr(
+        "app.services.redis_client.redis_from_url",
+        lambda url, **kw: _fake_mtproto_redis(payload),
+    )
+
+
+async def test_session_absent_when_no_session_provisioned(monkeypatch):
+    """No session provisioned → worker reports configured=False, session_present=False."""
+    import json
+
+    import app.services.status_service as status_service
+
+    _patch_redis(
+        monkeypatch,
+        json.dumps(
+            {
+                "connected": False,
+                "configured": False,
+                "session_present": False,
+                "last_connected": None,
+                "username": None,
+                "reported_at": time.time(),
+            }
+        ),
+    )
+    status = await status_service.collect_status()
+    assert status["mtproto"]["connected"] is False
+    assert status["mtproto"]["configured"] is False
+    assert status["mtproto"]["session_present"] is False
+    assert status["mtproto"]["stale"] is False
+
+
+async def test_session_present_but_disconnected(monkeypatch):
+    """Session provisioned but MTProto not connected (e.g. no internet)."""
+    import json
+
+    import app.services.status_service as status_service
+
+    _patch_redis(
+        monkeypatch,
+        json.dumps(
+            {
+                "connected": False,
+                "configured": True,
+                "session_present": True,
+                "last_connected": None,
+                "username": None,
+                "reported_at": time.time(),
+            }
+        ),
+    )
+    status = await status_service.collect_status()
+    assert status["mtproto"]["connected"] is False
+    assert status["mtproto"]["configured"] is True
+    assert status["mtproto"]["session_present"] is True
+
+
+async def test_session_present_and_connected(monkeypatch):
+    """Session provisioned, MTProto authenticated."""
+    import json
+
+    import app.services.status_service as status_service
+
+    _patch_redis(
+        monkeypatch,
+        json.dumps(
+            {
+                "connected": True,
+                "configured": True,
+                "session_present": True,
+                "last_connected": "2026-08-12T08:00:00+00:00",
+                "username": "@scanner",
+                "reported_at": time.time(),
+            }
+        ),
+    )
+    status = await status_service.collect_status()
+    assert status["mtproto"]["connected"] is True
+    assert status["mtproto"]["configured"] is True
+    assert status["mtproto"]["session_present"] is True
+    assert status["mtproto"]["last_connected"] == "2026-08-12T08:00:00+00:00"
+
+
+async def test_mtproto_configured_is_none_when_worker_has_not_reported(monkeypatch):
+    """Before the worker publishes its first state report, configured/session_present
+    must be None (UNKNOWN), not coerced to False."""
+    import app.services.status_service as status_service
+
+    _patch_redis(monkeypatch, None)
+    status = await status_service.collect_status()
+    assert status["mtproto"]["configured"] is None
+    assert status["mtproto"]["session_present"] is None
+    assert status["mtproto"]["stale"] is False
+
+
+# -------------------------------------------------------------- stale state
+
+
+async def test_stale_mtproto_state_detected(monkeypatch):
+    """A worker report older than the 300 s key TTL is marked stale."""
+    import json
+
+    import app.services.status_service as status_service
+
+    _patch_redis(
+        monkeypatch,
+        json.dumps(
+            {
+                "connected": True,
+                "configured": True,
+                "session_present": True,
+                "last_connected": "2026-08-12T08:00:00+00:00",
+                "username": "@scanner",
+                "reported_at": time.time() - 400,  # > TTL
+            }
+        ),
+    )
+    status = await status_service.collect_status()
+    assert status["mtproto"]["stale"] is True
+    # Stale does not erase the last-known state — callers interpret it
+
+
+async def test_mtproto_state_missing_is_not_stale(monkeypatch):
+    """No key at all (worker never wrote) → stale=False, values None."""
+    import app.services.status_service as status_service
+
+    _patch_redis(monkeypatch, None)
+    status = await status_service.collect_status()
+    assert status["mtproto"]["stale"] is False
+
+
+# -------------------------------------------------------------- revoked
+
+
+async def test_session_revoked_ui_priority(db, monkeypatch):
+    """Even when the worker reports session_present=True, the bot must
+    recognise REVOKED state from the database and let the UI prioritise it."""
+    import json
+
+    from app.services.session_state import mark_session_revoked, session_revoked
+
+    await mark_session_revoked()
+    assert await session_revoked() is True
+
+    # Simulate worker still reporting connected + present (race window
+    # before worker processed the revocation job).
+    _patch_redis(
+        monkeypatch,
+        json.dumps(
+            {
+                "connected": True,
+                "configured": True,
+                "session_present": True,
+                "last_connected": "2026-08-12T08:00:00+00:00",
+                "username": "@scanner",
+                "reported_at": time.time(),
+            }
+        ),
+    )
+    import app.services.status_service as status_service
+
+    status = await status_service.collect_status()
+    assert status["mtproto"]["session_present"] is True  # worker hasn't wiped yet
+
+    # The /authstatus handler (tested separately) must check revoked first.
+
+
+# -------------------------------------------------------------- heartbeat preservation
+
+
+async def test_set_mtproto_state_preserves_passed_kwargs():
+    """set_mtproto_state must write every keyword it receives to Redis."""
+    import json
+
+    from app.services.status_service import set_mtproto_state
+
+    written: dict = {}
+
+    async def _set(*args, **kwargs):
+        # args[0] = self, args[1] = key, args[2] = value
+        written.update(json.loads(args[2]))
+
+    fake_redis = type("FakeRedis", (), {"set": _set})()
+
+    await set_mtproto_state(
+        fake_redis,
+        connected=True,
+        last_connected=None,
+        username="@scanner",
+        configured=True,
+        session_present=True,
+    )
+    assert written["connected"] is True
+    assert written["configured"] is True
+    assert written["session_present"] is True
+
+
+async def test_set_mtproto_state_omitted_kwargs_are_none():
+    """Calling set_mtproto_state without configured/session_present stores None.
+    This is the heartbeat's contract — it must explicitly pass them to avoid
+    erasing existing values."""
+    import json
+
+    from app.services.status_service import set_mtproto_state
+
+    written: dict = {}
+
+    async def _set(*args, **kwargs):
+        written.update(json.loads(args[2]))
+
+    fake_redis = type("FakeRedis", (), {"set": _set})()
+
+    await set_mtproto_state(
+        fake_redis,
+        connected=True,
+        last_connected=None,
+        username=None,
+    )
+    assert written["connected"] is True
+    assert written["configured"] is None
+    assert written["session_present"] is None
+
+
+async def test_heartbeat_preserves_configured_and_session_present(monkeypatch):
+    """Regression: the heartbeat cron must pass configured + session_present,
+    not just connected/username.  The test calls the heartbeat function via a
+    patched redis and verifies the full payload written to the mtproto key."""
+    import json
+
+    from app.workers.functions import heartbeat
+
+    written_mtproto: dict = {}
+
+    async def _set(*args, **kwargs):
+        # args[0]=self, args[1]=key, args[2]=value
+        key = args[1] if len(args) > 1 else kwargs.get("name", "")
+        if key == "tbk:mtproto:state":
+            written_mtproto.update(json.loads(args[2] if len(args) > 2 else "{}"))
+
+    fake_redis = type("FakeRedis", (), {"set": _set})()
+
+    _g = type(
+        "G", (), {"connected": True, "last_connected": None, "account_username": "@test"}
+    )
+    monkeypatch.setattr("app.workers.functions._get_gateway", lambda: _g())
+    monkeypatch.setattr("app.workers.functions._mtproto_configured", True)
+    monkeypatch.setattr("app.workers.functions._session_present", True)
+
+    await heartbeat({"redis": fake_redis})
+    assert written_mtproto.get("configured") is True, "heartbeat MUST preserve configured"
+    assert written_mtproto.get("session_present") is True, "heartbeat MUST preserve session_present"
+    assert written_mtproto.get("connected") is True
+
+
+async def test_heartbeat_does_not_erase_false_values(monkeypatch):
+    """A heartbeat cycle with configured=False, session_present=False must
+    remain false, not become None/null."""
+    import json
+
+    from app.workers.functions import heartbeat
+
+    written_mtproto: dict = {}
+
+    async def _set(*args, **kwargs):
+        key = args[1] if len(args) > 1 else ""
+        if key == "tbk:mtproto:state":
+            written_mtproto.update(json.loads(args[2] if len(args) > 2 else "{}"))
+
+    fake_redis = type("FakeRedis", (), {"set": _set})()
+
+    _g = type(
+        "G", (), {"connected": False, "last_connected": None, "account_username": None}
+    )
+    monkeypatch.setattr("app.workers.functions._get_gateway", lambda: _g())
+    monkeypatch.setattr("app.workers.functions._mtproto_configured", False)
+    monkeypatch.setattr("app.workers.functions._session_present", False)
+
+    await heartbeat({"redis": fake_redis})
+    assert written_mtproto.get("configured") is False, "false must stay false"
+    assert written_mtproto.get("session_present") is False, "false must stay false"

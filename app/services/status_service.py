@@ -72,13 +72,23 @@ async def set_mtproto_state(
 
 
 async def get_mtproto_state() -> dict:
-    """Read the worker-reported MTProto state (bot/API processes)."""
-    empty = {
+    """Read the worker-reported MTProto state (bot/API processes).
+
+    Returns a dict with:
+    - available: whether a Redis key existed (True / False / "stale")
+    - connected, configured, session_present, last_connected, username,
+      reported_at: worker-reported values (None when unavailable)
+    - stale: True when the last report exceeded the Redis key TTL
+    """
+    empty: dict = {
         "connected": False,
         "last_connected": None,
         "username": None,
         "reported_at": None,
+        "configured": None,
+        "session_present": None,
         "available": False,
+        "stale": False,
     }
     if not await redis_available():
         return empty
@@ -95,8 +105,21 @@ async def get_mtproto_state() -> dict:
         state = json.loads(raw)
     except json.JSONDecodeError:
         return {**empty, "available": True}
-    state["available"] = True
-    return state
+    reported_at = state.get("reported_at")
+    stale = (
+        reported_at is not None
+        and time.time() - reported_at > 300  # key TTL
+    )
+    return {
+        "connected": bool(state.get("connected")),
+        "last_connected": state.get("last_connected"),
+        "username": state.get("username"),
+        "reported_at": reported_at,
+        "configured": state.get("configured"),
+        "session_present": state.get("session_present"),
+        "available": True,
+        "stale": stale,
+    }
 
 
 async def collect_status(
@@ -109,11 +132,15 @@ async def collect_status(
     state = await get_mtproto_state()
     # All of these are WORKER-reported: the bot/API processes have no
     # session material of their own (no api_id/hash, no session file).
+    # Raw values (None → "not reported yet") are preserved so the UI can
+    # distinguish UNKNOWN from explicit false.
     mtproto = {
         "connected": bool(state.get("connected")),
-        "configured": state.get("configured") or False,
+        "configured": state.get("configured"),
         "session_present": state.get("session_present"),
         "last_connected": state.get("last_connected"),
+        "reported_at": state.get("reported_at"),
+        "stale": state.get("stale", False),
     }
     status: dict = {
         "service": settings.environment,

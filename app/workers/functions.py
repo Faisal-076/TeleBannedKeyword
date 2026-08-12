@@ -26,6 +26,12 @@ _analysis_service = None
 _chat_service = None
 _session_store = None
 
+# Cached at startup so the heartbeat (every 30 s) never re-reads the
+# session file.  These are just the static worker-environment facts;
+# they never change across the worker's lifetime.
+_mtproto_configured: bool | None = None
+_session_present: bool | None = None
+
 
 def _get_gateway():
     global _gateway
@@ -73,7 +79,14 @@ def _get_session_store():
 
 
 async def startup(ctx) -> None:
-    logger.info("worker: starting up")
+    global _mtproto_configured, _session_present
+
+    from app.config import get_settings
+
+    settings = get_settings()
+    _mtproto_configured = settings.mtproto_configured
+    _session_present = (await _get_session_store().load()) is not None
+    logger.info("worker: starting up (configured=%s session=%s)", _mtproto_configured, _session_present)
     gateway = _get_gateway()
     connected = await gateway.connect()
     await _report_mtproto_state(connected)
@@ -91,8 +104,11 @@ async def _report_mtproto_state(connected: bool) -> None:
     """Publish MTProto state to Redis for the bot/API status endpoints.
 
     configured/session_present come from the WORKER's environment and
-    session store — the only process that owns them.
+    session store — the only process that owns them.  Values are cached
+    at startup so heartbeat calls never re-read the session file.
     """
+    global _mtproto_configured, _session_present
+
     try:
         from app.services.queue import redis_available
 
@@ -102,7 +118,6 @@ async def _report_mtproto_state(connected: bool) -> None:
         from app.services.redis_client import redis_from_url
 
         settings = get_settings()
-        session_present = (await _get_session_store().load()) is not None
         redis = redis_from_url(settings.redis_url, decode_responses=True)
         try:
             gateway = _get_gateway()
@@ -111,8 +126,8 @@ async def _report_mtproto_state(connected: bool) -> None:
                 connected,
                 gateway.last_connected,
                 gateway.account_username,
-                configured=settings.mtproto_configured,
-                session_present=session_present,
+                configured=_mtproto_configured,
+                session_present=_session_present,
             )
         finally:
             await redis.aclose()
@@ -246,7 +261,12 @@ async def heartbeat(ctx: dict) -> None:
     await redis.set(HEARTBEAT_WORKER_KEY, time.time(), ex=300)
     gateway = _get_gateway()
     await set_mtproto_state(
-        redis, gateway.connected, gateway.last_connected, gateway.account_username
+        redis,
+        gateway.connected,
+        gateway.last_connected,
+        gateway.account_username,
+        configured=_mtproto_configured,
+        session_present=_session_present,
     )
     logger.debug("worker: heartbeat")
 

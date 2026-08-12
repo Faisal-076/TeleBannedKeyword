@@ -60,17 +60,26 @@ async def cmd_status(message: Message) -> None:
         worker_line = f"Worker heartbeat age: {status['worker_heartbeat_age']:.0f}s"
     else:
         worker_line = "Worker heartbeat age: n/a (worker not running)"
-    session_present = status["mtproto"]["session_present"]
-    session_label = "n/a" if session_present is None else (
-        "present" if session_present else "absent"
-    )
+    mtproto = status["mtproto"]
+    configured_raw = mtproto["configured"]
+    configured_label = "unknown" if configured_raw is None else str(configured_raw)
+    session_present = mtproto["session_present"]
+    stale = mtproto.get("stale", False)
+    if stale:
+        session_label = "unknown (stale)"
+    elif session_present is None:
+        session_label = "unknown"
+    elif session_present:
+        session_label = "present"
+    else:
+        session_label = "absent"
     text = (
         f"🖥 System status\n"
         f"Environment: {status['service']}\n"
         f"Database: {status['database']}\n"
         f"Redis: {status['redis']}\n"
-        f"MTProto: {'CONNECTED' if status['mtproto']['connected'] else 'DISCONNECTED'}\n"
-        f"  configured={status['mtproto']['configured']} "
+        f"MTProto: {'CONNECTED' if mtproto['connected'] else 'DISCONNECTED'}\n"
+        f"  configured={configured_label} "
         f"session={session_label}\n"
         f"Bot API: {'configured' if status['bot_api']['configured'] else 'not configured'}\n"
         f"{worker_line}\n"
@@ -210,18 +219,31 @@ async def cmd_settings(message: Message, config: Settings) -> None:
 
 @router.message(Command("authstatus"))
 async def cmd_authstatus(message: Message) -> None:
-    # Session state is worker-reported: connection state comes from Redis
-    # (the worker publishes it), the revocation flag from Postgres. The bot
-    # has no session material of its own.
+    # Session state is worker-reported: connection state + session presence
+    # come from Redis (the worker publishes them), the revocation flag from
+    # Postgres. The bot has no session material of its own.
     state = await get_mtproto_state()
     revoked = await session_revoked()
     connected = bool(state.get("connected"))
     last_connected = state.get("last_connected") or "never (no worker report yet)"
+    stale = state.get("stale", False)
+
+    if revoked:
+        session_label = "REVOKED"
+    elif not state.get("available") or state.get("session_present") is None:
+        session_label = "UNKNOWN"
+    elif stale:
+        session_label = "UNKNOWN (stale)"
+    elif state.get("session_present"):
+        session_label = "PRESENT"
+    else:
+        session_label = "ABSENT"
+
     text = (
         "🔐 MTProto status\n"
         f"Connected (worker): {'CONNECTED' if connected else 'DISCONNECTED'}\n"
-        f"Account: {state.get('username', 'unknown')}\n"
-        f"Session: {'REVOKED' if revoked else 'PRESENT'}\n"
+        f"Account: {state.get('username') or 'None'}\n"
+        f"Session: {session_label}\n"
         f"Last successful connection: {last_connected}"
     )
     await message.answer(text)
