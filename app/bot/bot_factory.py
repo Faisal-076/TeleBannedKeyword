@@ -13,7 +13,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 
-from app.bot.handlers import chats, check, commands
+from app.bot.handlers import chats, check, commands, auth_commands
 from app.bot.middleware import AuthorizationMiddleware, OperationLogMiddleware
 from app.config import get_settings
 from app.services.analysis_service import AnalysisService
@@ -42,6 +42,7 @@ def build_dispatcher(
     dispatcher.include_router(commands.router)
     dispatcher.include_router(chats.router)
     dispatcher.include_router(check.router)
+    dispatcher.include_router(auth_commands.router)
 
     if not settings.bot_configured:
         return dispatcher, None

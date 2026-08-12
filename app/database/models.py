@@ -308,3 +308,58 @@ class AppState(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now_naive, onupdate=utc_now_naive
     )
+
+
+class AuthUserStatus(str, enum.Enum):
+    AUTHORIZED = "authorized"
+    REVOKED = "revoked"
+
+
+class AuthUserRole(str, enum.Enum):
+    USER = "user"
+    ADMIN = "admin"
+
+
+class AuthorizedUser(Base):
+    """Bot users authorized by root admins.  Canonical identity = telegram_user_id."""
+
+    __tablename__ = "authorized_users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
+    username: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    display_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default=AuthUserStatus.AUTHORIZED.value, index=True)
+    role: Mapped[str] = mapped_column(String(16), default=AuthUserRole.USER.value)
+    authorized_by: Mapped[int] = mapped_column(BigInteger)
+    authorized_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now_naive
+    )
+    revoked_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now_naive
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now_naive, onupdate=utc_now_naive
+    )
+
+
+class PendingAction(Base):
+    """Server-side record for inline-callback confirmations (authorize / revoke).
+    Callback data contains a random token; the handler resolves it here to
+    verify the actor, target and expiry."""
+
+    __tablename__ = "pending_actions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    token: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    action: Mapped[str] = mapped_column(String(16))  # "authorize" | "revoke"
+    actor_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    target_user_id: Mapped[int] = mapped_column(BigInteger)
+    target_username: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now_naive
+    )
