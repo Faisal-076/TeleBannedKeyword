@@ -1,4 +1,7 @@
-"""arq worker runner (production command: `tbk-worker`)."""
+"""arq worker runner (production command: `tbk-worker`).
+
+The worker process is the single owner of the MTProto scanner session.
+"""
 
 from __future__ import annotations
 
@@ -11,8 +14,12 @@ from arq.worker import Worker
 from app.config import get_settings
 from app.logging_conf import configure_logging
 from app.workers.functions import (
+    add_chat,
     analyze_message,
+    check_chat,
     heartbeat,
+    recover_queued,
+    revoke_session,
     run_retention,
     shutdown,
     startup,
@@ -23,9 +30,19 @@ from app.workers.functions import (
 def build_worker() -> Worker:
     settings = get_settings()
     return Worker(
-        functions=[analyze_message, sync_chat, run_retention, heartbeat],
+        functions=[
+            analyze_message,
+            sync_chat,
+            add_chat,
+            check_chat,
+            revoke_session,
+            run_retention,
+            recover_queued,
+            heartbeat,
+        ],
         cron_jobs=[
             cron(heartbeat, second="*/30"),
+            cron(recover_queued, second="*/15"),
             cron(run_retention, minute=0, hour=3, run_at_startup=False),
         ],
         redis_settings=RedisSettings.from_dsn(settings.redis_url),

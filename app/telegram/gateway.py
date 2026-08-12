@@ -91,6 +91,13 @@ class TelegramGateway:
     def last_connected(self) -> datetime | None:
         return self._last_connected
 
+    @property
+    def account_username(self) -> str | None:
+        """Masked scanner username (for worker-reported status)."""
+        if self._me is None:
+            return None
+        return mask_username(getattr(self._me, "username", None))
+
     async def connect(self) -> bool:
         async with self._connect_lock:
             if self.connected:
@@ -148,8 +155,14 @@ class TelegramGateway:
                 pass
 
     async def ensure_connected(self) -> None:
-        if not await self.connect():
-            raise TelegramAccessError("mtproto not connected", code=AccessState.ERROR.value)
+        if await self.connect():
+            return
+        if await self._session_store.is_revoked():
+            raise SessionExpiredError("session revoked")
+        raise TelegramAccessError(
+            "mtproto not connected (no session or connect failed)",
+            code=AccessState.ERROR.value,
+        )
 
     async def get_me_info(self) -> dict:
         await self.ensure_connected()
@@ -191,6 +204,19 @@ class TelegramGateway:
                     return await factory(self._client)
             except Exception as exc:  # noqa: BLE001
                 code, retryable = classify_access_error(exc)
+                message = redact_telegram_error(str(exc))
+                if code == "flood_wait":
+                    # Telethon only auto-sleeps waits below
+                    # MT_PROTO_FLOOD_SLEEP_THRESHOLD; anything longer surfaces
+                    # here and is capped to MT_PROTO_MAX_FLOOD_SLEEP.
+                    raw = getattr(exc, "seconds", 60) or 60
+                    seconds = min(float(raw), float(self._settings.mt_proto_max_flood_sleep))
+                    logger.warning(
+                        "telegram: flood wait chat=%s seconds=%.0f (capped at %.0f)",
+                        chat_id, float(raw), seconds,
+                        extra={"extra": {"code": code, "chat_id": chat_id}},
+                    )
+                    raise ChatFloodWaitError(seconds) from exc
                 if retryable and attempts < self._settings.mt_proto_retry_limit:
                     delay = min(2.0**attempts + random.uniform(0, 1), 30.0)
                     logger.warning(
@@ -198,16 +224,14 @@ class TelegramGateway:
                         delay,
                         attempts,
                         self._settings.mt_proto_retry_limit,
-                        extra={"extra": {"code": code}},
+                        extra={"extra": {"code": code, "chat_id": chat_id}},
                     )
                     await asyncio.sleep(delay)
                     continue
-                message = redact_telegram_error(str(exc))
-                if code == "flood_wait":
-                    seconds = float(getattr(exc, "seconds", 60) or 60)
-                    raise ChatFloodWaitError(seconds) from exc
-                if code == AccessState.ERROR.value:
-                    raise SessionExpiredError(message) if not retryable else NetworkError(message)
+                if code == "session_expired":
+                    raise SessionExpiredError(message) from exc
+                if code == "network_error":
+                    raise NetworkError(message) from exc
                 raise TelegramAccessError(message, code=code, retryable=retryable) from exc
 
     # ------------------------------------------------------------------ entity / chat
@@ -285,27 +309,28 @@ class TelegramGateway:
     async def _resolve_invite(self, invite_hash: str) -> ResolvedChat:
         assert self._client is not None
         from telethon import functions
+        from telethon.tl.types import ChatInvite, ChatInviteAlready
 
         try:
             result = await self._call(
                 None,
                 lambda client: client(functions.messages.CheckChatInviteRequest(hash=invite_hash)),
             )
-            entity = getattr(result, "chat", None)
-            if entity is None:
-                # ChatInvite (not joined yet) → join now
-                invite = result
-                entity = getattr(invite, "chat", None)
-                if entity is None:
-                    return ResolvedChat(
-                        chat_id=0, title="", username=None, chat_type="unknown",
-                        access_state=AccessState.INVALID_INVITE, error="invalid_invite",
-                    )
-                await self._call(
-                    None,
-                    lambda client: client(functions.messages.JoinChannelRequest(channel=entity)),
-                )
-            return _resolved_from_entity(entity, AccessState.ACCESSIBLE)
+            if isinstance(result, ChatInviteAlready) and getattr(result, "chat", None) is not None:
+                # The scanner account is already a member — safe to analyze.
+                return _resolved_from_entity(result.chat, AccessState.ACCESSIBLE)
+            # ChatInvite (not joined yet): the tool NEVER joins chats
+            # automatically. The operator must join with the scanner account
+            # first, then add the chat again.
+            title = getattr(result, "title", None) or "" if isinstance(result, ChatInvite) else ""
+            return ResolvedChat(
+                chat_id=0,
+                title=title,
+                username=None,
+                chat_type="unknown",
+                access_state=AccessState.PRIVATE_NO_ACCESS,
+                error="private_no_access",
+            )
         except TelegramAccessError as exc:
             return ResolvedChat(
                 chat_id=0, title="", username=None, chat_type="unknown",
@@ -470,23 +495,27 @@ def _peer_for_id(chat_id: int):
 
 
 def _resolved_from_entity(entity: Any, access_state: AccessState) -> ResolvedChat:
-    chat_id = getattr(entity, "id", 0)
-    if getattr(entity, "is_channel", False):
-        chat_id = -1_000_000_000_000 - int(chat_id)
-    elif getattr(entity, "is_group", False):
-        chat_id = -int(chat_id)
+    from telethon.tl.types import Chat as TLChat
+    from telethon.tl.types import Channel as TLChannel
+    from telethon.tl.types import User as TLUser
+
+    raw_id = int(getattr(entity, "id", 0))
+    chat_id = raw_id
     title = getattr(entity, "title", None) or getattr(entity, "first_name", None) or ""
     username = getattr(entity, "username", None)
-    if hasattr(entity, "megagroup") and entity.megagroup:
-        chat_type = "forum" if getattr(entity, "forum", False) else "supergroup"
-    elif getattr(entity, "is_channel", False):
-        chat_type = "channel"
-    elif getattr(entity, "is_group", False):
+    chat_type = "unknown"
+    if isinstance(entity, TLChannel):
+        # Channels and supergroups share the -100xxxxxxxxxxxx convention,
+        # symmetric with `_peer_for_id`.
+        chat_id = -1_000_000_000_000 - raw_id
+        chat_type = "forum" if getattr(entity, "forum", False) else (
+            "supergroup" if getattr(entity, "megagroup", False) else "channel"
+        )
+    elif isinstance(entity, TLChat):
+        chat_id = -raw_id
         chat_type = "group"
-    elif getattr(entity, "is_user", False):
+    elif isinstance(entity, TLUser):
         chat_type = "user"
-    else:
-        chat_type = "unknown"
     return ResolvedChat(
         chat_id=chat_id,
         title=title or "",

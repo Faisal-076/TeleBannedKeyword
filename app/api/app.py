@@ -17,6 +17,7 @@ from app.api.schemas import (
 from app.api.security import ADMIN_DEPENDENCY
 from app.config import get_settings
 from app.rules import repository as rules_repo
+from app.services.analysis_service import AnalysisService
 from app.services.chat_service import ChatService
 from app.services.queue import enqueue
 from app.services.status_service import collect_status
@@ -91,20 +92,16 @@ def create_app(
         }
 
     @admin.post("/chats")
-    async def admin_add_chat(
-        payload: ChatAddRequest,
-        chats: ChatService = _chats_dep(chat_service),
-    ) -> ChatAddResponse:
-        result = await chats.add_chat(payload.reference, actor="api")
-        if not result.ok or result.chat is None:
-            return ChatAddResponse(ok=False, error=result.error)
-        return ChatAddResponse(
-            ok=True,
-            chat_id=result.chat.telegram_chat_id,
-            title=result.chat.title,
-            username=result.chat.username,
-            chat_type=result.chat.chat_type,
+    async def admin_add_chat(payload: ChatAddRequest) -> ChatAddResponse:
+        # Chat resolution requires MTProto; it runs ONLY in the worker.
+        # The API queues the job and never opens an MTProto session.
+        queued = await enqueue(
+            "add_chat", payload.reference, "api",
+            job_id=f"add-chat:{payload.reference}",
         )
+        if not queued:
+            return ChatAddResponse(ok=False, error="worker unavailable (redis down)")
+        return ChatAddResponse(ok=True, queued=True)
 
     @admin.delete("/chats/{chat_id}")
     async def admin_delete_chat(chat_id: int, chats: ChatService = _chats_dep(chat_service)) -> dict:
@@ -189,8 +186,8 @@ def _chats_dep(chat_service: ChatService | None):
     async def dependency() -> ChatService:
         if chat_service is not None:
             return chat_service
-        from app.telegram.gateway import create_gateway
-
-        return ChatService(create_gateway())
+        # DB-only service: no MTProto gateway is ever created in the API
+        # process. Chat resolution is queued to the worker.
+        return ChatService()
 
     return Depends(dependency)

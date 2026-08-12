@@ -1,6 +1,10 @@
 # Railway deployment definition (two services, same image).
 # Postgres and Redis: add via Railway dashboard plugins, then set
 # DATABASE_URL / REDIS_URL as shared variables.
+#
+# MTProto ownership: ONLY the worker opens the scanner session, so ONLY the
+# worker mounts the /data volume (SESSION_FILE=/data/session.enc). The bot
+# service never touches the session file.
 
 [build]
 builder = "DOCKERFILE"
@@ -14,9 +18,6 @@ restartPolicyMaxRetries = 10
 
 [services.bot]
 command = "python -m app.main bot"
-[[services.bot.volumes]]
-mountPath = "/data"
-name = "session-data"
 
 [services.worker]
 command = "python -m app.main worker"

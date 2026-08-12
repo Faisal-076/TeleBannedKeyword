@@ -38,22 +38,19 @@ async def _run_bot_service() -> None:
     from app.database.init_db import init_db
     from app.services.analysis_service import AnalysisService
     from app.services.chat_service import ChatService
-    from app.telegram.gateway import create_gateway
     from app.telegram.session_store import SessionStore
 
     settings = get_settings()
     await init_db()
 
-    gateway = create_gateway()
-    try:
-        await gateway.connect()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("bot: mtproto connect failed at startup: %s", type(exc).__name__)
-
+    # The bot process NEVER opens an MTProto session. The worker is the
+    # single owner of the scanner account: it resolves chats, searches
+    # history and runs analysis jobs. The bot only queues work and reads
+    # worker-reported status from Redis.
     session_store = SessionStore()
-    analysis = AnalysisService(gateway)
-    chat_service = ChatService(gateway)
-    dispatcher, bot = build_dispatcher(gateway, analysis, chat_service, session_store)
+    analysis = AnalysisService()
+    chat_service = ChatService()
+    dispatcher, bot = build_dispatcher(analysis, chat_service, session_store)
     if bot is None:
         raise RuntimeError("BOT_TOKEN is required to run the bot service")
 
@@ -62,7 +59,7 @@ async def _run_bot_service() -> None:
     # API server + polling run in the same process (Railway service 1).
     from app.api.app import create_app
 
-    api_app = create_app(gateway, analysis=analysis, chat_service=chat_service)
+    api_app = create_app(gateway=None, analysis=analysis, chat_service=chat_service)
 
     async def _serve_api() -> None:
         import uvicorn
@@ -77,7 +74,6 @@ async def _run_bot_service() -> None:
         await asyncio.gather(start_bot_polling(dispatcher, bot), _serve_api())
     finally:
         heartbeat_task.cancel()
-        await gateway.disconnect()
 
 
 def run_bot() -> None:

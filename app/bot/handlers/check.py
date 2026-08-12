@@ -50,8 +50,9 @@ async def on_draft_submitted(message: Message, state: FSMContext, analysis: Anal
         return
     if result.degraded:
         await message.answer(
-            f"🧠 Analysis queued (degraded mode — Redis unavailable). Request `{result.request_id}`.\n"
-            "The result will appear here shortly."
+            f"🧠 Request stored (Redis unavailable — the worker is offline). "
+            f"Request `{result.request_id}`.\n"
+            "It will be analyzed automatically once the worker is back."
         )
     else:
         await message.answer(

@@ -2,6 +2,12 @@
 
 Every exception carries an `error_code` string so workers and the bot can
 degrade gracefully per-chat instead of crashing the pipeline.
+
+Classification contract:
+- flood_wait      → ChatFloodWaitError (bounded; operator alert)
+- session_expired → SessionExpiredError (auth key revoked/unregistered)
+- network_error   → NetworkError (transient, retryable)
+- anything else   → TelegramAccessError with the mapped access state
 """
 
 from __future__ import annotations
@@ -39,79 +45,59 @@ class TelegramAccessError(Exception):
 
 
 class ChatFloodWaitError(TelegramAccessError):
+    """Telegram asked us to wait; the wait is capped and reported."""
+
     code = "flood_wait"
-    retryable = True
+    retryable = False  # retrying sooner than `seconds` is pointless
 
     def __init__(self, seconds: float):
-        super().__init__(f"flood wait {int(seconds)}s", code=self.code, retryable=True)
+        super().__init__(f"flood wait {int(seconds)}s", code=self.code, retryable=False)
         self.seconds = seconds
 
 
 class SessionExpiredError(TelegramAccessError):
+    """The scanner session is invalid/revoked; provisioning is required."""
+
     code = "session_expired"
     retryable = False
 
 
 class NetworkError(TelegramAccessError):
+    """Transient transport/unknown failure; safe to retry with backoff."""
+
     code = "network_error"
     retryable = True
 
 
-_KNOWN_MAPPINGS: dict[tuple[str, ...], str] = {
-    ("UsernameNotOccupiedError", "UsernameInvalidError"): AccessState.USERNAME_NOT_FOUND.value,
-    ("ChannelPrivateError", "ChatIdInvalidError"): AccessState.PRIVATE_NO_ACCESS.value,
-    ("ChatAdminRequiredError", "ChatAdminRequiredError"): AccessState.INSUFFICIENT_PERMISSIONS.value,
-    ("UserBannedInChannelError"): AccessState.BANNED.value,
-    ("ChannelInvalidError", "ChatInvalidError"): AccessState.DELETED.value,
-    ("ChatMigrateError"): AccessState.MIGRATED.value,
-    ("ChatForbiddenError", "UserNotParticipantError", "ChatParticipantNotFoundError"):
-        AccessState.NOT_MEMBER.value,
-    ("InviteHashExpiredError", "InviteHashInvalidError"): AccessState.INVALID_INVITE.value,
-    ("UserRestrictedError"): AccessState.RESTRICTED.value,
-    ("AuthKeyUnregisteredError", "UnauthorizedError"): AccessState.ERROR.value,
-}
-
-
 def classify_access_error(exc: BaseException) -> tuple[str, bool]:
-    """Map a caught exception to (access_state_code, retryable)."""
-    from telethon.errors import (
-        AuthKeyUnregisteredError,
-        ChannelPrivateError,
-        ChatAdminRequiredError,
-        ChatForbiddenError,
-        ChatIdInvalidError,
-        ChatInvalidError,
-        ChatMigrateError,
-        FloodWaitError,
-        InviteHashExpiredError,
-        InviteHashInvalidError,
-        UnauthorizedError,
-        UserBannedInChannelError,
-        UserNotParticipantError,
-        UserRestrictedError,
-        UsernameInvalidError,
-        UsernameNotOccupiedError,
-    )
+    """Map a caught exception to (error_code, retryable)."""
+    from telethon import errors
 
-    if isinstance(exc, FloodWaitError):
-        return AccessState.ERROR.value, True
-    for exc_type, code in (
-        (UsernameNotOccupiedError, AccessState.USERNAME_NOT_FOUND.value),
-        (UsernameInvalidError, AccessState.USERNAME_NOT_FOUND.value),
-        (ChannelPrivateError, AccessState.PRIVATE_NO_ACCESS.value),
-        (ChatIdInvalidError, AccessState.PRIVATE_NO_ACCESS.value),
-        (ChatAdminRequiredError, AccessState.INSUFFICIENT_PERMISSIONS.value),
-        (UserBannedInChannelError, AccessState.BANNED.value),
-        (ChatInvalidError, AccessState.DELETED.value),
-        (ChatMigrateError, AccessState.MIGRATED.value),
-        (ChatForbiddenError, AccessState.NOT_MEMBER.value),
-        (UserNotParticipantError, AccessState.NOT_MEMBER.value),
-        (InviteHashExpiredError, AccessState.INVALID_INVITE.value),
-        (InviteHashInvalidError, AccessState.INVALID_INVITE.value),
-        (UserRestrictedError, AccessState.RESTRICTED.value),
-        (AuthKeyUnregisteredError, AccessState.ERROR.value),
-        (UnauthorizedError, AccessState.ERROR.value),
-    ):
+    if isinstance(exc, errors.FloodWaitError):
+        return "flood_wait", False
+
+    access_mappings = (
+        (errors.UsernameNotOccupiedError, AccessState.USERNAME_NOT_FOUND.value),
+        (errors.UsernameInvalidError, AccessState.USERNAME_NOT_FOUND.value),
+        (errors.ChannelPrivateError, AccessState.PRIVATE_NO_ACCESS.value),
+        (errors.ChatIdInvalidError, AccessState.PRIVATE_NO_ACCESS.value),
+        (errors.ChatAdminRequiredError, AccessState.INSUFFICIENT_PERMISSIONS.value),
+        (errors.UserBannedInChannelError, AccessState.BANNED.value),
+        (errors.ChatInvalidError, AccessState.DELETED.value),
+        (errors.ChatForbiddenError, AccessState.NOT_MEMBER.value),
+        (errors.UserNotParticipantError, AccessState.NOT_MEMBER.value),
+        (errors.InviteHashExpiredError, AccessState.INVALID_INVITE.value),
+        (errors.InviteHashInvalidError, AccessState.INVALID_INVITE.value),
+        (errors.UserRestrictedError, AccessState.RESTRICTED.value),
+        (errors.AuthKeyUnregisteredError, "session_expired"),
+        (errors.UnauthorizedError, "session_expired"),
+        (errors.AccessTokenInvalidError, "session_expired"),
+    )
+    for exc_type, code in access_mappings:
         if isinstance(exc, exc_type):
             return code, False
-    return AccessState.ERROR.value, False
+
+    # Any other RPC/transport failure is treated as transient (retryable);
+    # a persistent problem surfaces after MT_PROTO_RETRY_LIMIT attempts as
+    # a NetworkError instead of a false "session expired" alarm.
+    return "network_error", True

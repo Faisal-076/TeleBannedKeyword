@@ -1,5 +1,10 @@
 """Target chat management commands: /addchat /removechat /listchats
-/chatinfo /enablechat /disablechat."""
+/chatinfo /enablechat /disablechat.
+
+Chat verification (which requires MTProto) is queued to the worker — the
+bot process never opens an MTProto session. Results are reported back via
+the worker's Bot API notifications.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +16,7 @@ from aiogram.types import Message
 
 from app.bot.handlers.helpers import chat_reference_from_message
 from app.services.chat_service import ChatService
+from app.services.queue import enqueue
 from app.telegram.errors import AccessState
 
 logger = logging.getLogger("app.bot.handlers.chats")
@@ -33,7 +39,7 @@ _ACCESS_LABEL = {
 
 
 @router.message(Command("addchat"))
-async def cmd_addchat(message: Message, command: CommandObject, chats: ChatService) -> None:
+async def cmd_addchat(message: Message, command: CommandObject) -> None:
     reference = chat_reference_from_message(message) or (command.args or "").strip()
     if not reference:
         await message.answer(
@@ -41,21 +47,20 @@ async def cmd_addchat(message: Message, command: CommandObject, chats: ChatServi
             "You can also reply to a forwarded message from the chat."
         )
         return
-    result = await chats.add_chat(reference, actor=str(message.from_user.id))
-    if not result.ok:
-        await message.answer(f"❌ Cannot add chat: {result.error}")
-        return
-    chat = result.chat
-    assert chat is not None
-    await message.answer(
-        f"✅ Chat added (verified access)\n"
-        f"Title: {chat.title or '-'}\n"
-        f"Username: @{chat.username if chat.username else '-'}\n"
-        f"Type: {chat.chat_type}\n"
-        f"Chat id: {chat.telegram_chat_id}\n"
-        f"Enabled: {chat.enabled}\n\n"
-        f"Run /sync {chat.telegram_chat_id} initial to index its history."
+    queued = await enqueue(
+        "add_chat", reference, str(message.from_user.id),
+        job_id=f"add-chat:{reference}",
     )
+    if queued:
+        await message.answer(
+            "🔍 Chat verification queued. The worker will resolve access "
+            "via the scanner account and report the result here."
+        )
+    else:
+        await message.answer(
+            "❌ Cannot queue chat verification (Redis unavailable). "
+            "Retry when the worker is online."
+        )
 
 
 @router.message(Command("removechat"))
@@ -95,21 +100,18 @@ async def cmd_chatinfo(message: Message, command: CommandObject, chats: ChatServ
     if chat_id is None:
         await message.answer("Chat not found.")
         return
-    chat = await chats.get_chat(chat_id)
-    if chat is None:
-        await message.answer("Chat not found.")
-        return
-    info = await chats.check_chat(chat)
-    state = info.get("access_state", "error")
-    label = _ACCESS_LABEL.get(state, state)
-    await message.answer(
-        f"🔎 {info.get('title', chat.title or '')}\n"
-        f"Username: {info.get('username', '-')}\n"
-        f"Chat id: {chat.telegram_chat_id}\n"
-        f"Access: {label}\n"
-        f"Type: {chat.chat_type}\n"
-        f"Sync: {chat.sync_state} (indexed {chat.sync_indexed_count})"
+    queued = await enqueue(
+        "check_chat", chat_id, str(message.from_user.id),
+        job_id=f"check-chat:{chat_id}",
     )
+    if queued:
+        await message.answer(
+            "🔎 Access re-verification queued. The result will be reported here."
+        )
+    else:
+        await message.answer(
+            "❌ Cannot queue verification (Redis unavailable). Retry when the worker is online."
+        )
 
 
 @router.message(Command("enablechat"))

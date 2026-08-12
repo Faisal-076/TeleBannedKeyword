@@ -11,6 +11,7 @@ class ChatAddRequest(BaseModel):
 
 class ChatAddResponse(BaseModel):
     ok: bool
+    queued: bool = False
     chat_id: int | None = None
     title: str | None = None
     username: str | None = None

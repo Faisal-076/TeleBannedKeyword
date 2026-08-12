@@ -14,8 +14,7 @@ from app.config import Settings
 from app.database.models import Rule, RuleKind, RuleScope
 from app.rules import repository as rules_repo
 from app.services.queue import enqueue
-from app.services.status_service import collect_status
-from app.telegram.gateway import TelegramGateway
+from app.services.status_service import collect_status, get_mtproto_state
 from app.telegram.session_store import SessionStore
 
 logger = logging.getLogger("app.bot.handlers.commands")
@@ -55,8 +54,8 @@ async def cmd_help(message: Message) -> None:
 
 
 @router.message(Command("status"))
-async def cmd_status(message: Message, gateway: TelegramGateway) -> None:
-    status = await collect_status(gateway)
+async def cmd_status(message: Message) -> None:
+    status = await collect_status(None)
     if status["worker_heartbeat_age"] is not None:
         worker_line = f"Worker heartbeat age: {status['worker_heartbeat_age']:.0f}s"
     else:
@@ -70,7 +69,8 @@ async def cmd_status(message: Message, gateway: TelegramGateway) -> None:
         f"  configured={status['mtproto']['configured']} "
         f"session={status['mtproto']['session_present']}\n"
         f"Bot API: {'configured' if status['bot_api']['configured'] else 'not configured'}\n"
-        f"{worker_line}"
+        f"{worker_line}\n"
+        f"MTProto state is reported by the worker process."
     )
     await message.answer(text)
 
@@ -206,16 +206,18 @@ async def cmd_settings(message: Message, config: Settings) -> None:
 
 @router.message(Command("authstatus"))
 async def cmd_authstatus(
-    message: Message, gateway: TelegramGateway, session_store: SessionStore
+    message: Message, session_store: SessionStore
 ) -> None:
-    info = await gateway.get_me_info()
+    state = await get_mtproto_state()
     revoked = await session_store.is_revoked()
+    connected = bool(state.get("connected"))
+    last_connected = state.get("last_connected") or "never (no worker report yet)"
     text = (
         "🔐 MTProto status\n"
-        f"Connected: {'CONNECTED' if info.get('connected') else 'DISCONNECTED'}\n"
-        f"Account: {info.get('username', 'unknown')}\n"
+        f"Connected (worker): {'CONNECTED' if connected else 'DISCONNECTED'}\n"
+        f"Account: {state.get('username', 'unknown')}\n"
         f"Session: {'REVOKED' if revoked else 'PRESENT'}\n"
-        f"Last successful connection: {info.get('last_connected', 'never')}"
+        f"Last successful connection: {last_connected}"
     )
     await message.answer(text)
 
@@ -231,15 +233,27 @@ async def cmd_logout(message: Message) -> None:
 
 @router.callback_query(F.data == "confirm_logout")
 async def cb_confirm_logout(
-    callback: CallbackQuery, gateway: TelegramGateway, session_store: SessionStore
+    callback: CallbackQuery, session_store: SessionStore
 ) -> None:
     await callback.answer("Revoking…")
-    try:
-        await gateway.disconnect()
-        await session_store.revoke()
-        await callback.message.answer("Session revoked. Provision a new one with `tbk-auth`.")
-    except Exception as exc:  # noqa: BLE001
-        await callback.message.answer(f"Revocation failed: {type(exc).__name__}")
+    queued = await enqueue("revoke_session", job_id="revoke-session")
+    if queued:
+        await callback.message.answer(
+            "Session revocation queued. The worker will disconnect and "
+            "wipe the session file."
+        )
+    else:
+        # Redis is down: mark revoked in the database now; the worker
+        # refuses to reconnect once it sees the flag (and the file can be
+        # deleted from the worker volume on next start).
+        try:
+            await session_store.revoke()
+            await callback.message.answer(
+                "Session marked REVOKED (Redis unavailable — worker could "
+                "not be notified; it will refuse to reconnect)."
+            )
+        except Exception as exc:  # noqa: BLE001
+            await callback.message.answer(f"Revocation failed: {type(exc).__name__}")
     await callback.message.edit_reply_markup(reply_markup=None)
 
 
@@ -250,8 +264,8 @@ async def cb_cancel_logout(callback: CallbackQuery) -> None:
 
 
 @router.message(Command("admin"))
-async def cmd_admin(message: Message, gateway: TelegramGateway) -> None:
-    status = await collect_status(gateway)
+async def cmd_admin(message: Message) -> None:
+    status = await collect_status(None)
     stats = status["analysis"]
     if status["worker_heartbeat_age"] is not None:
         worker_line = f"Worker heartbeat: {status['worker_heartbeat_age']:.0f}s ago"

@@ -1,4 +1,8 @@
-"""Dispatcher assembly: storage, middlewares, routers, workflow data."""
+"""Dispatcher assembly: storage, middlewares, routers, workflow data.
+
+The bot process never owns an MTProto session; it queues work for the
+worker and reads worker-reported status. No gateway is injected.
+"""
 
 from __future__ import annotations
 
@@ -14,21 +18,18 @@ from app.bot.middleware import AuthorizationMiddleware, OperationLogMiddleware
 from app.config import get_settings
 from app.services.analysis_service import AnalysisService
 from app.services.chat_service import ChatService
-from app.telegram.gateway import TelegramGateway
 from app.telegram.session_store import SessionStore
 
 logger = logging.getLogger("app.bot.factory")
 
 
 def build_dispatcher(
-    gateway: TelegramGateway,
     analysis: AnalysisService,
     chat_service: ChatService,
     session_store: SessionStore,
 ) -> tuple[Dispatcher, Bot | None]:
     settings = get_settings()
     dispatcher = Dispatcher(storage=MemoryStorage())
-    dispatcher["gateway"] = gateway
     dispatcher["analysis"] = analysis
     dispatcher["chats"] = chat_service
     dispatcher["session_store"] = session_store

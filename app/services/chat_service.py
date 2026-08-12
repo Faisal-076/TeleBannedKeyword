@@ -1,7 +1,9 @@
-"""Target chat management backed by the MTProto gateway.
+"""Target chat management (database-only).
 
-Additions only succeed when the scanner account can actually reach the chat;
-inaccessible private groups are rejected gracefully with a clear reason.
+MTProto resolution happens ONLY in the worker process (jobs `add_chat` /
+`check_chat` in app/workers/functions.py). The bot and the admin API never
+open an MTProto session — they queue work and persist what the worker
+resolves. Inaccessible private groups are rejected with a clear reason.
 """
 
 from __future__ import annotations
@@ -11,12 +13,11 @@ from dataclasses import dataclass
 
 from sqlalchemy import select
 
-from app.config import get_settings
 from app.database.engine import session_scope
 from app.database.models import AuditEvent, TargetChat
 from app.security.redact import mask_username
 from app.telegram.errors import AccessState
-from app.telegram.gateway import TelegramGateway
+from app.telegram.gateway import ResolvedChat, TelegramGateway
 from app.utils.timeutil import utc_now_naive
 
 logger = logging.getLogger("app.services.chats")
@@ -31,11 +32,13 @@ class AddChatResult:
 
 
 class ChatService:
-    def __init__(self, gateway: TelegramGateway) -> None:
+    def __init__(self, gateway: TelegramGateway | None = None) -> None:
+        # `gateway` is accepted for backward compatibility only; all MTProto
+        # work has moved to worker jobs. Nothing here touches MTProto.
         self._gateway = gateway
 
-    async def add_chat(self, raw: str | int, actor: str = "cli") -> AddChatResult:
-        resolved = await self._gateway.resolve_chat(raw)
+    async def persist_resolved(self, resolved: ResolvedChat, actor: str) -> AddChatResult:
+        """Persist a chat that the worker already resolved via MTProto."""
         if resolved.access_state != AccessState.ACCESSIBLE:
             message = {
                 AccessState.USERNAME_NOT_FOUND.value: "username not found",
@@ -85,6 +88,25 @@ class ChatService:
             )
             return AddChatResult(ok=True, chat=chat)
 
+    async def apply_chat_info(self, chat: TargetChat, info: ResolvedChat) -> dict:
+        """Persist a fresh access-state/verification result (worker-written)."""
+        ok = info.access_state == AccessState.ACCESSIBLE
+        async with session_scope() as session:
+            row = await session.get(TargetChat, chat.id)
+            if row is not None:
+                row.access_state = info.access_state.value
+                row.access_error = None if ok else info.error
+                row.last_verified_at = utc_now_naive()
+                if info.title:
+                    row.title = info.title
+        return {
+            "chat_id": chat.telegram_chat_id,
+            "title": info.title or chat.title,
+            "username": mask_username(info.username or chat.username),
+            "access_state": info.access_state.value,
+            "ok": ok,
+        }
+
     async def remove_chat(self, chat_id: int) -> bool:
         async with session_scope() as session:
             result = await session.execute(
@@ -128,26 +150,3 @@ class ChatService:
                 )
             )
             return chat
-
-    async def check_chat(self, chat: TargetChat) -> dict:
-        """Re-verify access and refresh metadata. Never raises for one chat."""
-        try:
-            info = await self._gateway.get_chat_info(chat.telegram_chat_id)
-        except Exception as exc:  # noqa: BLE001
-            return {"chat_id": chat.telegram_chat_id, "ok": False, "error": type(exc).__name__}
-        ok = info.access_state == AccessState.ACCESSIBLE
-        async with session_scope() as session:
-            row = await session.get(TargetChat, chat.id)
-            if row is not None:
-                row.access_state = info.access_state.value
-                row.access_error = None if ok else info.error
-                row.last_verified_at = utc_now_naive()
-                if info.title:
-                    row.title = info.title
-        return {
-            "chat_id": chat.telegram_chat_id,
-            "title": info.title or chat.title,
-            "username": mask_username(info.username or chat.username),
-            "access_state": info.access_state.value,
-            "ok": ok,
-        }

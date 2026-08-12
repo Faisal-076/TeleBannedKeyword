@@ -101,7 +101,7 @@ class HistorySearcher:
                     best[0],
                 )
 
-        if coverage.is_complete:
+        if coverage.is_complete or not get_settings().require_coverage_for_unseen:
             return (
                 HistoryEvidence(
                     state=HistoryState.UNSEEN,

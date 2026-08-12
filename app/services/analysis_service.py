@@ -1,13 +1,14 @@
-"""Analysis request lifecycle: submit → queue → run → store → retrieve.
+"""Analysis request lifecycle: submit → queue → run (worker) → store → retrieve.
 
 - Submissions are never forwarded to any Telegram chat (analysis-only).
 - Jobs are idempotent: re-running the same request id is a no-op once DONE.
-- If Redis is down, jobs run inline as background tasks (degraded mode).
+- The bot NEVER executes analysis itself. If Redis is down the request stays
+  queued in the database; the worker's `recover_queued` cron picks it up as
+  soon as infrastructure recovers.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from dataclasses import dataclass
 
@@ -39,18 +40,25 @@ class SubmitResult:
 
 
 class AnalysisService:
-    def __init__(self, gateway: TelegramGateway) -> None:
+    def __init__(self, gateway: TelegramGateway | None = None) -> None:
+        # `gateway` is only used by `run_request` and is always provided by
+        # the worker (the single MTProto owner). The bot uses this service
+        # purely for submit/status/retrieve, which need no MTProto.
         self._gateway = gateway
         self._settings = get_settings()
-        self._inline_tasks: set[asyncio.Task] = set()
 
     async def submit(
         self,
         text: str,
         user_id: int,
         *,
-        launch_inline: bool = True,
+        launch_inline: bool = False,
     ) -> SubmitResult:
+        if launch_inline:
+            raise ValueError(
+                "inline execution was removed: the bot never opens an MTProto session; "
+                "requests are processed by the worker."
+            )
         if not text or not text.strip():
             return SubmitResult(None, "empty message")
         if len(text) > self._settings.max_message_chars:
@@ -75,22 +83,39 @@ class AnalysisService:
         queued = await enqueue("analyze_message", request_id, job_id=request_id)
         if queued:
             return SubmitResult(request_id=request_id, queued=True)
-        if not launch_inline:
-            return SubmitResult(request_id=request_id, queued=False, degraded=True)
-        # degraded mode: run inline
-        task = asyncio.create_task(self._run_wrapped(request_id))
-        self._inline_tasks.add(task)
-        task.add_done_callback(self._inline_tasks.discard)
+        # Redis is down: the request is persisted and the worker's
+        # `recover_queued` cron will enqueue it once Redis is back.
         return SubmitResult(request_id=request_id, queued=False, degraded=True)
 
-    async def _run_wrapped(self, request_id: str) -> None:
-        try:
-            await self.run_request(request_id)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("analysis: inline job failed request=%s err=%s", request_id, type(exc).__name__)
+    async def recover_queued(self, limit: int = 100) -> int:
+        """Re-enqueue analysis requests left QUEUED by a Redis outage/crash.
+
+        Called by the worker cron; only the worker process runs it, so it can
+        never execute analysis inside the bot.
+        """
+        async with session_scope() as session:
+            result = await session.execute(
+                select(AnalysisRequest.id)
+                .where(AnalysisRequest.status == AnalysisStatus.QUEUED.value)
+                .order_by(AnalysisRequest.created_at)
+                .limit(limit)
+            )
+            request_ids = [row[0] for row in result.all()]
+        recovered = 0
+        for request_id in request_ids:
+            try:
+                if await enqueue("analyze_message", request_id, job_id=request_id):
+                    recovered += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("recover: enqueue failed request=%s err=%s", request_id, type(exc).__name__)
+        if recovered:
+            logger.info("analysis: recovered %d queued requests", recovered)
+        return recovered
 
     async def run_request(self, request_id: str) -> AnalysisOutcome | None:
         """Execute one analysis job (worker entry point). Idempotent."""
+        if self._gateway is None:
+            raise RuntimeError("run_request requires an MTProto gateway (worker process only)")
         async with session_scope() as session:
             request = await session.get(AnalysisRequest, request_id)
             if request is None:
@@ -135,8 +160,6 @@ class AnalysisService:
                     request.status = AnalysisStatus.DONE.value
                     request.completed_at = utc_now_naive()
                 except IntegrityError:
-                    # another concurrent runner (inline fallback + worker)
-                    # persisted this request first; theirs wins.
                     return None
             logger.info(
                 "analysis: done request=%s user=%s score=%s",
@@ -194,9 +217,14 @@ class AnalysisService:
         request_id: str,
         new_text: str,
         *,
-        launch_inline: bool = True,
+        launch_inline: bool = False,
     ) -> SubmitResult:
         """Re-analyze the same request id with edited text."""
+        if launch_inline:
+            raise ValueError(
+                "inline execution was removed: the bot never opens an MTProto session; "
+                "requests are processed by the worker."
+            )
         if len(new_text) > self._settings.max_message_chars:
             return SubmitResult(
                 None,
@@ -220,9 +248,4 @@ class AnalysisService:
         queued = await enqueue("analyze_message", request_id, job_id=f"{request_id}:{request.retry_count}")
         if queued:
             return SubmitResult(request_id=request_id, queued=True)
-        if not launch_inline:
-            return SubmitResult(request_id=request_id, queued=False, degraded=True)
-        task = asyncio.create_task(self._run_wrapped(request_id))
-        self._inline_tasks.add(task)
-        task.add_done_callback(self._inline_tasks.discard)
         return SubmitResult(request_id=request_id, queued=False, degraded=True)

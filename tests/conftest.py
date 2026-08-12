@@ -148,7 +148,12 @@ class FakeGateway:
         if isinstance(raw, int):
             meta = self.chat_meta.get(raw, {})
         else:
-            ref = str(raw).lstrip("@").lower()
+            ref = str(raw).strip().lstrip("@").lower()
+            if "/+" in ref or ref.startswith("+") or "joinchat" in ref:
+                return _Resolved(
+                    0, "", None, "unknown",
+                    AccessState.PRIVATE_NO_ACCESS, None, "private_no_access",
+                )
             meta = next(
                 (m for m in self.chat_meta.values() if (m.get("username") or "").lower() == ref),
                 {},

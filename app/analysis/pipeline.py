@@ -220,16 +220,21 @@ class AnalysisPipeline:
             if fuzzy_term and evidence.note:
                 finding.history.note = evidence.note
                 finding.reason = "Similar wording observed historically; verify intent."
-            if evidence.state == HistoryState.UNKNOWN:
+            if evidence.state == HistoryState.UNSEEN:
+                finding.reason = "Not observed in the available chat history (unusual/unfamiliar wording)."
+            elif evidence.state == HistoryState.UNKNOWN:
                 finding.reason = "Historical coverage unavailable — treated as unknown."
+            elif evidence.state == HistoryState.SEEN:
+                # The term exists in history: a novelty flag is no longer
+                # justified — the finding (if it stays) is re-scored by
+                # frequent/rare usage instead of unseen-ness.
+                finding.reason = "Term has appeared in chat history; novelty flag dropped."
 
     def _unseen_scan(self, chat, doc, findings: list[Finding]) -> None:
         covered = {f.term.casefold() for f in findings}
         candidates: list[str] = []
         for token in doc.tokens:
-            if len(token) < UNSEEN_MIN_TOKEN_LEN:
-                continue
-            if token in _COMMON_WORDS or token.isdigit():
+            if not self._unseen_candidate(token):
                 continue
             if token in covered:
                 continue
@@ -237,9 +242,7 @@ class AnalysisPipeline:
             covered.add(token)
         for bi in doc.bigrams:
             words = bi.split(" ")
-            if len(bi) < 10 or len(words) < 2:
-                continue
-            if all(w in _COMMON_WORDS for w in words) or bi in covered:
+            if len(words) != 2 or not all(self._unseen_candidate(w) for w in words):
                 continue
             if bi in covered:
                 continue
@@ -256,6 +259,28 @@ class AnalysisPipeline:
                     reason="Not observed in the available chat history (unusual/unfamiliar wording).",
                 )
             )
+
+    @staticmethod
+    def _unseen_candidate(token: str) -> bool:
+        """Novelty candidates only: real words, no codes/links/mentions.
+
+        Filters cut most false positives: numbers/codes, URLs, mentions,
+        hashtags, punctuation and pure-symbol tokens never become UNSEEN
+        findings.
+        """
+        if len(token) < UNSEEN_MIN_TOKEN_LEN:
+            return False
+        if not any(ch.isalpha() for ch in token):
+            return False
+        if any(ch.isdigit() for ch in token):
+            return False
+        if token in _COMMON_WORDS:
+            return False
+        if token.startswith(("@", "#")):
+            return False
+        if any(ch in token for ch in ("/", "\\", ".", ",", ":", ";")):
+            return False
+        return True
 
     def _merge_ai(self, outcome: AnalysisOutcome, ai: object) -> None:
         from app.llm.base import LLMAnalysis

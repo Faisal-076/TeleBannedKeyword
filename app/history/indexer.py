@@ -219,6 +219,10 @@ class HistoryIndexer:
                 row.sync_at = utc_now_naive()
 
     async def _persist_estimate(self, chat: TargetChat, estimate: int | None) -> None:
+        if estimate is None:
+            # Never wipe a previous estimate: coverage must degrade only
+            # with evidence, not with a failed estimate call.
+            return
         async with session_scope() as session:
             row = await session.get(TargetChat, chat.id)
             if row is not None:
