@@ -94,11 +94,11 @@ async def _report_mtproto_state(connected: bool) -> None:
 
         if not await redis_available():
             return
-        from redis.asyncio import from_url
+        from app.services.redis_client import redis_from_url
 
         from app.config import get_settings
 
-        redis = from_url(get_settings().redis_url, decode_responses=True)
+        redis = redis_from_url(get_settings().redis_url, decode_responses=True)
         try:
             gateway = _get_gateway()
             await set_mtproto_state(

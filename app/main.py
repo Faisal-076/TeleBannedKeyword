@@ -20,9 +20,9 @@ async def _bot_heartbeat_loop() -> None:
     settings = get_settings()
     while True:
         try:
-            from redis.asyncio import from_url
+            from app.services.redis_client import redis_from_url
 
-            redis = from_url(settings.redis_url, decode_responses=True)
+            redis = redis_from_url(settings.redis_url, decode_responses=True)
             try:
                 await redis.set(HEARTBEAT_BOT_KEY, time.time(), ex=300)
             finally:
@@ -78,8 +78,10 @@ async def _run_bot_service() -> None:
 
 def run_bot() -> None:
     from app.config import get_settings
+    from app.config.validate import ROLE_BOT, validate_role_env
 
     settings = get_settings()
+    validate_role_env(ROLE_BOT)
     configure_logging(settings.log_level, settings.log_privacy_level)
     asyncio.run(_run_bot_service())
 
@@ -95,8 +97,10 @@ async def _run_worker_service() -> None:
 
 def run_worker() -> None:
     from app.config import get_settings
+    from app.config.validate import ROLE_WORKER, validate_role_env
 
     settings = get_settings()
+    validate_role_env(ROLE_WORKER)
     configure_logging(settings.log_level, settings.log_privacy_level)
     asyncio.run(_run_worker_service())
 
@@ -118,8 +122,10 @@ async def _run_api_service() -> None:
 
 def run_api() -> None:
     from app.config import get_settings
+    from app.config.validate import ROLE_API, validate_role_env
 
     settings = get_settings()
+    validate_role_env(ROLE_API)
     configure_logging(settings.log_level, settings.log_privacy_level)
     asyncio.run(_run_api_service())
 

@@ -32,6 +32,7 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/tbk
       REDIS_URL: redis://redis:6379/0
+      AUTO_CREATE_SCHEMA: "false"
     ports:
       - "8000:8000"
     depends_on:
@@ -48,6 +49,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/tbk
       REDIS_URL: redis://redis:6379/0
       SESSION_FILE: /data/session.enc
+      AUTO_CREATE_SCHEMA: "false"
     depends_on:
       postgres:
         condition: service_healthy

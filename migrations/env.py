@@ -1,4 +1,8 @@
-"""Alembic async environment. Reads DATABASE_URL from application settings."""
+"""Alembic async environment. Reads DATABASE_URL from application settings.
+
+On Postgres, migrations run under a session-level advisory lock so that
+multiple replicas starting concurrently cannot race `alembic upgrade head`.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +10,7 @@ import asyncio
 from logging.config import fileConfig
 
 from alembic import context
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.config import get_settings
@@ -16,6 +21,8 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata
+
+_MIGRATION_LOCK_KEY = "tbk:migrations"
 
 
 def run_migrations_offline() -> None:
@@ -38,9 +45,24 @@ def do_run_migrations(connection) -> None:
 
 async def run_migrations_online() -> None:
     engine = create_async_engine(get_settings().database_url)
-    async with engine.connect() as connection:
-        await connection.run_sync(do_run_migrations)
-    await engine.dispose()
+    try:
+        async with engine.connect() as connection:
+            is_postgres = connection.dialect.name == "postgresql"
+            if is_postgres:
+                await connection.execute(
+                    text("SELECT pg_advisory_lock(hashtext(:k))"),
+                    {"k": _MIGRATION_LOCK_KEY},
+                )
+            try:
+                await connection.run_sync(do_run_migrations)
+            finally:
+                if is_postgres:
+                    await connection.execute(
+                        text("SELECT pg_advisory_unlock(hashtext(:k))"),
+                        {"k": _MIGRATION_LOCK_KEY},
+                    )
+    finally:
+        await engine.dispose()
 
 
 if context.is_offline_mode():

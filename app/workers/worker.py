@@ -50,8 +50,7 @@ def build_worker() -> Worker:
         on_shutdown=shutdown,
         max_jobs=5,
         job_timeout=settings.worker_job_timeout,
-        keep_result=0,
-        keep_result_failed=3600,
+        keep_result=3600,
         health_check_interval=15,
     )
 

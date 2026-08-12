@@ -31,7 +31,7 @@ Telegram (Bot API)          Telegram (MTProto)
           │ enqueue                   │
           ▼                           ▼
 ┌──────────────────────────────────────────────┐
-│ arq job queue (Redis) + inline fallback      │
+│ arq job queue (Redis); lost jobs stay queued in Postgres │
 ├──────────────────────────────────────────────┤
 │ Analysis pipeline: normalize → tokenize →    │
 │ rules/regex/fuzzy → history evidence →       │
@@ -164,24 +164,27 @@ python scripts/auth_session.py --phone +15551234567 --output session.enc
 
 ---
 
-## 7. Railway deployment
+## 7. Managed deployment (Railway / Northflank)
 
-1. Create a Railway project from this repository (Dockerfile).
-2. Add **PostgreSQL** and **Redis** plugins.
-3. Add two services from the same image:
+Railway: create a project from this repository (Dockerfile), add PostgreSQL
+and Redis plugins, then two services from the same image:
 
 | Service  | Start command              | Variables                              |
 |----------|----------------------------|----------------------------------------|
 | bot      | `python -m app.main bot`   | `DATABASE_URL`, `REDIS_URL`, all below |
 | worker   | `python -m app.main worker`| same                                   |
 
-4. Add a **volume** mounted at `/data` to both services (session file).
-5. Set environment variables (see §10). All secrets as Railway **variables
-   (locked)**.
+4. Add a **volume** mounted at `/data` to the **worker only** (session file;
+   the bot never touches the scanner session).
+5. Set environment variables (see §10). All secrets as locked variables.
 6. `/health` is the healthcheck path; `/ready` verifies DB + bot config.
 
-`railway.toml` declares two services with volumes; treat it as the base and
-attach the plugin-generated `DATABASE_URL`/`REDIS_URL`.
+`railway.toml` declares two services with the worker volume; treat it as the
+base and attach the plugin-generated `DATABASE_URL`/`REDIS_URL`.
+
+For **Northflank**, follow the step-by-step guide in
+[`NORTHFLANK.md`](NORTHFLANK.md) (volume uid 10001, internal hostnames,
+`rediss://` TLS Redis, startup command selection).
 
 ---
 
@@ -201,8 +204,10 @@ Used by:
   daily `retention`).
 - worker/bot heartbeats (`tbk:heartbeat:worker`, `tbk:heartbeat:bot`).
 
-If Redis is down, the bot degrades: analysis jobs run inline in-process and
-`/health` reports `redis: error`.
+If Redis is down, the bot degrades: submissions stay **queued in the
+database** (the bot never runs analysis inline — it has no MTProto session)
+and `/health` reports `redis: error`. The worker's `recover_queued` cron
+re-enqueues pending requests as soon as Redis is back.
 
 ---
 
@@ -257,8 +262,8 @@ Set the result as `MASTER_SECRET`. Roll it carefully (see §17).
 
 ## 12. Persistent volume configuration
 
-Railway: add a volume to the `bot` and `worker` services, mount path
-`/data`, then set `SESSION_FILE=/data/session.enc` and provision:
+Add a volume to the **worker service only**, mount path `/data`, then set
+`SESSION_FILE=/data/session.enc` and provision:
 
 ```bash
 python scripts/auth_session.py --phone +1... --output session.enc
@@ -295,7 +300,7 @@ reported as `UNKNOWN`, never `UNSEEN`/banned.
 | `session: decryption failed` | `MASTER_SECRET` mismatch — rotate both together |
 | chat shows `private_no_access` | scanner account is not a member — join with an invite link first |
 | `flood_wait` in logs | normal; worker sleeps via jittered backoff, job continues |
-| Redis down | degraded inline mode; `/health` shows `redis: error` |
+| Redis down | degraded mode: submissions stay queued in Postgres; `recover_queued` picks them up |
 | `History not indexed` | run `/sync <chat> initial` |
 | Worker results not delivered | notifications are sent from the worker via Bot API; check worker logs |
 

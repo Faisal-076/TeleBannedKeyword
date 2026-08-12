@@ -7,9 +7,16 @@ __pycache__
 .mypy_cache
 .ruff_cache
 .env
+.env.*
 *.session
+*.session-journal
+session.enc
+*.pem
+*.key
 data
 logs
 tests
 docs
 *.md
+!README.md
+*.log

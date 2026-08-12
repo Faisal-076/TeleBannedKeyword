@@ -79,6 +79,11 @@ class Settings(BaseSettings):
     initial_sync_max_messages: int = 200_000
     incremental_sync_batch: int = 500
 
+    # ---- Deployment ----
+    # Local dev creates the schema on startup. Deployments use Alembic
+    # (SET AUTO_CREATE_SCHEMA=false to disable this).
+    auto_create_schema: bool = True
+
     # ---- MTProto rate limiting ----
     mt_proto_max_concurrency: int = 3
     mt_proto_chat_min_interval: float = 0.6

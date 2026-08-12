@@ -4,7 +4,10 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
-RUN addgroup --system app && adduser --system --ingroup app app
+# Pinned uid/gid (10001) so a mounted volume's file ownership is deterministic
+# regardless of the container platform (see NORTHFLANK.md).
+RUN groupadd --system --gid 10001 app \
+    && useradd --system --uid 10001 --gid app --no-create-home --shell /usr/sbin/nologin app
 
 WORKDIR /app
 

@@ -1,7 +1,9 @@
 """Job queueing with graceful degradation.
 
-Primary path: arq (Redis). If Redis is unavailable, jobs run inline as
-background asyncio tasks so the bot keeps working in degraded mode.
+Primary path: arq (Redis). If Redis is unavailable, `enqueue` returns False
+and the request stays QUEUED in the database; the worker's `recover_queued`
+cron picks it up once infrastructure recovers. The bot never runs jobs
+inline (it has no MTProto session).
 """
 
 from __future__ import annotations
