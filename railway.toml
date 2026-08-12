@@ -1,0 +1,25 @@
+# Railway deployment definition (two services, same image).
+# Postgres and Redis: add via Railway dashboard plugins, then set
+# DATABASE_URL / REDIS_URL as shared variables.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+healthcheckPath = "/health"
+healthcheckTimeout = 120
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+
+[services.bot]
+command = "python -m app.main bot"
+[[services.bot.volumes]]
+mountPath = "/data"
+name = "session-data"
+
+[services.worker]
+command = "python -m app.main worker"
+[[services.worker.volumes]]
+mountPath = "/data"
+name = "session-data-worker"
