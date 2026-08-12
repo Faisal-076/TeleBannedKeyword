@@ -1,10 +1,4 @@
-"""Target chat management commands: /addchat /removechat /listchats
-/chatinfo /enablechat /disablechat.
-
-Chat verification (which requires MTProto) is queued to the worker — the
-bot process never opens an MTProto session. Results are reported back via
-the worker's Bot API notifications.
-"""
+"""Target chat management commands — all user-scoped."""
 
 from __future__ import annotations
 
@@ -38,107 +32,107 @@ _ACCESS_LABEL = {
 }
 
 
+def _caller_id(message: Message) -> int:
+    return message.from_user.id if message.from_user else 0
+
+
 @router.message(Command("addchat"))
 async def cmd_addchat(message: Message, command: CommandObject) -> None:
     reference = chat_reference_from_message(message) or (command.args or "").strip()
     if not reference:
-        await message.answer(
-            "Usage: /addchat <@username | t.me link | invite link | chat id>\n"
-            "You can also reply to a forwarded message from the chat."
-        )
+        await message.answer("Usage: /addchat <@username | t.me link | invite link | chat id>")
         return
-    queued = await enqueue(
-        "add_chat", reference, str(message.from_user.id),
-        job_id=f"add-chat:{reference}",
-    )
+    user_id = _caller_id(message)
+    queued = await enqueue("add_chat", reference, str(user_id), job_id=f"add-chat:{user_id}:{reference}")
     if queued:
-        await message.answer(
-            "🔍 Chat verification queued. The worker will resolve access "
-            "via the scanner account and report the result here."
-        )
+        await message.answer("Chat verification queued. The worker will report the result here.")
     else:
-        await message.answer(
-            "❌ Cannot queue chat verification (Redis unavailable). "
-            "Retry when the worker is online."
-        )
+        await message.answer("Cannot queue (Redis unavailable).")
 
 
 @router.message(Command("removechat"))
 async def cmd_removechat(message: Message, command: CommandObject, chats: ChatService) -> None:
+    user_id = _caller_id(message)
     reference = chat_reference_from_message(message) or (command.args or "").strip()
-    chat_id = await _resolve_to_id(reference, chats)
+    chat_id = await _resolve_to_id(reference, chats, user_id)
     if chat_id is None:
-        await message.answer("Chat not found.")
+        await message.answer("Chat is not configured for your account.")
         return
-    if await chats.remove_chat(chat_id):
+    if await chats.remove_chat(chat_id, user_id=user_id):
         await message.answer(f"Removed chat {chat_id}.")
     else:
-        await message.answer("Chat not found.")
+        await message.answer("Chat is not configured for your account.")
 
 
 @router.message(Command("listchats"))
 async def cmd_listchats(message: Message, chats: ChatService) -> None:
-    chat_list = await chats.list_chats()
+    user_id = _caller_id(message)
+    chat_list = await chats.list_chats(user_id)
     if not chat_list:
-        await message.answer("No chats configured. Use /addchat.")
+        await message.answer("You have no configured chats. Use /addchat.")
         return
-    lines = ["💬 Configured chats"]
+    lines = ["Your configured chats"]
     for chat in chat_list:
         username = f"@{chat.username}" if chat.username else "-"
         enabled = "enabled" if chat.enabled else "disabled"
-        lines.append(
-            f"• {chat.title or '(untitled)'} | {username} | {chat.chat_type} | "
-            f"{chat.access_state} | {enabled} | {chat.telegram_chat_id}"
-        )
+        lines.append(f"{chat.title or '(untitled)'} | {username} | {chat.chat_type} | {chat.access_state} | {enabled} | {chat.telegram_chat_id}")
     await message.answer("\n".join(lines))
 
 
 @router.message(Command("chatinfo"))
 async def cmd_chatinfo(message: Message, command: CommandObject, chats: ChatService) -> None:
+    user_id = _caller_id(message)
     reference = chat_reference_from_message(message) or (command.args or "").strip()
-    chat_id = await _resolve_to_id(reference, chats)
+    chat_id = await _resolve_to_id(reference, chats, user_id)
     if chat_id is None:
-        await message.answer("Chat not found.")
+        await message.answer("Chat is not configured for your account.")
         return
-    queued = await enqueue(
-        "check_chat", chat_id, str(message.from_user.id),
-        job_id=f"check-chat:{chat_id}",
-    )
+    queued = await enqueue("check_chat", chat_id, str(user_id), job_id=f"check-chat:{user_id}:{chat_id}")
     if queued:
-        await message.answer(
-            "🔎 Access re-verification queued. The result will be reported here."
-        )
+        await message.answer("Access re-verification queued. Result will appear here.")
     else:
-        await message.answer(
-            "❌ Cannot queue verification (Redis unavailable). Retry when the worker is online."
-        )
+        await message.answer("Cannot queue (Redis unavailable).")
 
 
 @router.message(Command("enablechat"))
 async def cmd_enablechat(message: Message, command: CommandObject, chats: ChatService) -> None:
+    user_id = _caller_id(message)
     reference = (command.args or "").strip()
-    chat_id = await _resolve_to_id(reference, chats)
+    chat_id = await _resolve_to_id(reference, chats, user_id)
     if chat_id is None:
-        await message.answer("Chat not found.")
+        await message.answer("Chat is not configured for your account.")
         return
-    chat = await chats.set_enabled(chat_id, True)
-    await message.answer(f"Enabled chat {chat_id}." if chat else "Chat not found.")
+    chat = await chats.set_enabled(chat_id, True, user_id=user_id)
+    await message.answer(f"Enabled chat {chat_id}." if chat else "Chat is not configured for your account.")
 
 
 @router.message(Command("disablechat"))
 async def cmd_disablechat(message: Message, command: CommandObject, chats: ChatService) -> None:
+    user_id = _caller_id(message)
     reference = (command.args or "").strip()
-    chat_id = await _resolve_to_id(reference, chats)
+    chat_id = await _resolve_to_id(reference, chats, user_id)
     if chat_id is None:
-        await message.answer("Chat not found.")
+        await message.answer("Chat is not configured for your account.")
         return
-    chat = await chats.set_enabled(chat_id, False)
-    await message.answer(f"Disabled chat {chat_id}." if chat else "Chat not found.")
+    chat = await chats.set_enabled(chat_id, False, user_id=user_id)
+    await message.answer(f"Disabled chat {chat_id}." if chat else "Chat is not configured for your account.")
 
 
-async def _resolve_to_id(reference: str, chats: ChatService) -> int | None:
+async def _resolve_to_id(reference: str, chats: ChatService, user_id: int) -> int | None:
     if not reference:
         return None
+    ref = reference.strip().lstrip("@")
+    chat_list = await chats.list_chats(user_id)
+    if ref.isdigit():
+        cid = int(ref)
+        if any(c.telegram_chat_id == cid or c.id == cid for c in chat_list):
+            return cid
+    for chat in chat_list:
+        if chat.username and chat.username.lower() == ref.lower():
+            return chat.telegram_chat_id
+        if str(chat.telegram_chat_id) == ref:
+            return chat.telegram_chat_id
+    return None
     ref = reference.strip().lstrip("@")
     chat_list = await chats.list_chats()
     if ref.isdigit():

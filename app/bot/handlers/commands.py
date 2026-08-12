@@ -90,7 +90,8 @@ async def cmd_status(message: Message) -> None:
 
 @router.message(Command("history"))
 async def cmd_history(message: Message, chats) -> None:
-    chats_list = await chats.list_chats()
+    user_id = message.from_user.id if message.from_user else 0
+    chats_list = await chats.list_chats(user_id)
     if not chats_list:
         await message.answer("No chats configured.")
         return
@@ -109,6 +110,7 @@ async def cmd_history(message: Message, chats) -> None:
 
 @router.message(Command("sync"))
 async def cmd_sync(message: Message, command: CommandObject, chats) -> None:
+    user_id = message.from_user.id if message.from_user else 0
     args = (command.args or "").split()
     target = args[0] if args else "all"
     mode = args[1] if len(args) > 1 else "incremental"
@@ -116,13 +118,13 @@ async def cmd_sync(message: Message, command: CommandObject, chats) -> None:
         await message.answer("Mode must be one of: initial | incremental | resync")
         return
     if target == "all":
-        chats_list = await chats.list_chats()
+        chats_list = await chats.list_chats(user_id)
         enabled = [c for c in chats_list if c.enabled]
         for chat in enabled:
             await enqueue("sync_chat", chat.telegram_chat_id, mode)
         await message.answer(f"Queued {len(enabled)} chat syncs ({mode}).")
         return
-    resolved = await _resolve_reference(target, chats)
+    resolved = await _resolve_reference(target, chats, user_id)
     if resolved is None:
         await message.answer("Chat not found. Check /listchats.")
         return
@@ -308,9 +310,9 @@ async def cmd_admin(message: Message) -> None:
     await message.answer(text)
 
 
-async def _resolve_reference(reference: str, chats) -> int | None:
+async def _resolve_reference(reference: str, chats, user_id: int) -> int | None:
     ref = reference.strip().lstrip("@")
-    chats_list = await chats.list_chats()
+    chats_list = await chats.list_chats(user_id)
     if ref.isdigit():
         chat_id = int(ref)
         if any(c.telegram_chat_id == chat_id or c.id == chat_id for c in chats_list):

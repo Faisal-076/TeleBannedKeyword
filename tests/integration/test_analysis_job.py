@@ -9,6 +9,7 @@ from app.database.models import (
     Rule,
     SyncState,
     TargetChat,
+    UserChatTarget,
 )
 from app.rules.repository import create_rule
 from app.services.analysis_service import AnalysisService
@@ -17,6 +18,7 @@ from tests.conftest import make_message
 
 CHAT_A = -1001001
 CHAT_B = -1001002
+TEST_USER = 111
 
 
 async def _seed_chat(chat_id: int, *, sync: bool = True, access: str = "accessible") -> TargetChat:
@@ -33,6 +35,13 @@ async def _seed_chat(chat_id: int, *, sync: bool = True, access: str = "accessib
             sync_cursor=3 if sync else None,
         )
         session.add(chat)
+        target = UserChatTarget(
+            user_id=TEST_USER,
+            telegram_chat_id=chat_id,
+            enabled=True,
+            access_mode="central_public",
+        )
+        session.add(target)
         await session.flush()
         return chat
 

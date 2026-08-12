@@ -107,7 +107,7 @@ def create_app(
 
     @admin.get("/chats")
     async def admin_list_chats(chats: ChatService = _chats_dep(chat_service)) -> dict:
-        chat_list = await chats.list_chats()
+        chat_list = await chats.admin_list_chats()
         return {
             "chats": [
                 {
@@ -141,7 +141,7 @@ def create_app(
 
     @admin.delete("/chats/{chat_id}")
     async def admin_delete_chat(chat_id: int, chats: ChatService = _chats_dep(chat_service)) -> dict:
-        removed = await chats.remove_chat(chat_id)
+        removed = await chats.admin_remove_chat(chat_id)
         return {"removed": removed}
 
     @admin.post("/chats/{chat_id}/sync")

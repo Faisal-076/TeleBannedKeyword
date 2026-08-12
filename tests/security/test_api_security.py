@@ -101,7 +101,7 @@ async def test_admin_crud_flow(db, fake_gateway, monkeypatch):
     from app.telegram.errors import AccessState
 
     resolved = _ResolvedChat(CHAT_ID, "Public Group", "publicgroup", "group")
-    await ChatService().persist_resolved(resolved, actor="api")
+    await ChatService().persist_resolved(resolved, actor="api", owner_user_id=111)
     listed = client.get("/api/v1/admin/chats", headers=headers)
     assert len(listed.json()["chats"]) == 1
     removed = client.delete(f"/api/v1/admin/chats/{CHAT_ID}", headers=headers)

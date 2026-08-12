@@ -90,7 +90,11 @@ class RuleKind(str, enum.Enum):
 
 
 class TargetChat(Base):
-    """A chat configured for analysis by the operator."""
+    """A Telegram chat configured for analysis by one or more users.
+
+    Global metadata shared across users (title, username, type).
+    Ownership and per-user settings live in ``UserChatTarget``.
+    """
 
     __tablename__ = "telegram_chats"
 
@@ -362,4 +366,71 @@ class PendingAction(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now_naive
+    )
+
+
+class AccessMode(str, enum.Enum):
+    CENTRAL_PUBLIC = "central_public"
+    USER_SESSION = "user_session"
+    UNAVAILABLE = "unavailable"
+
+
+class AccessIdentityStatus(str, enum.Enum):
+    CONNECTED = "connected"
+    DISCONNECTED = "disconnected"
+    REVOKED = "revoked"
+    ABSENT = "absent"
+    INVALID = "invalid"
+
+
+class TelegramAccessIdentity(Base):
+    """A user-provisioned Telegram session identity for private-target access."""
+
+    __tablename__ = "telegram_access_identities"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    owner_user_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
+    label: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    telegram_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(16), default=AccessIdentityStatus.ABSENT.value
+    )
+    session_ref: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    last_connected_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now_naive
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now_naive, onupdate=utc_now_naive
+    )
+
+
+class UserChatTarget(Base):
+    """Per-user target chat configuration.  Two users may independently
+    configure the same Telegram chat — ownership is per-user."""
+
+    __tablename__ = "user_chat_targets"
+    __table_args__ = (
+        UniqueConstraint("user_id", "telegram_chat_id", name="uq_user_chat"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
+    telegram_chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    access_mode: Mapped[str] = mapped_column(
+        String(16), default=AccessMode.CENTRAL_PUBLIC.value
+    )
+    access_identity_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now_naive
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now_naive, onupdate=utc_now_naive
     )

@@ -69,6 +69,156 @@ async def test_bot_dispatcher_authorizes_message_and_callback_events(bot_dispatc
         assert any(isinstance(item, OperationLogMiddleware) for item in middlewares)
 
 
+async def test_text_transform_is_last_and_preserves_commands_and_check_flow(
+    bot_dispatcher,
+    db,
+    monkeypatch,
+):
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    from aiogram import Bot
+    from aiogram.enums import ChatType, MessageEntityType
+    from aiogram.methods import SendMessage
+    from aiogram.types import Chat, Message, MessageEntity, Update, User
+
+    from app.bot.handlers import commands
+
+    class RecordingBot(Bot):
+        def __init__(self) -> None:
+            super().__init__("123456:TESTTOKENabcdefghijklmnopqrstuvwxyz0123456789")
+            self.texts: list[str] = []
+            self.parse_modes: list[object] = []
+
+        async def __call__(self, method, request_timeout=None):
+            if isinstance(method, SendMessage):
+                self.texts.append(method.text)
+                self.parse_modes.append(method.parse_mode)
+            return True
+
+    class StubAnalysis:
+        def __init__(self) -> None:
+            self.submissions: list[tuple[str, int]] = []
+
+        async def submit(self, text: str, user_id: int):
+            self.submissions.append((text, user_id))
+            return SimpleNamespace(request_id="test-request", degraded=False)
+
+    async def fake_collect_status(_gateway):
+        return {
+            "service": "test",
+            "database": "ok",
+            "redis": "ok",
+            "mtproto": {
+                "configured": True,
+                "connected": True,
+                "session_present": True,
+                "stale": False,
+            },
+            "bot_api": {"configured": True},
+            "worker_heartbeat_age": None,
+        }
+
+    async def fake_mtproto_state():
+        return {
+            "available": True,
+            "connected": True,
+            "username": "@test",
+            "session_present": True,
+            "last_connected": "now",
+            "stale": False,
+        }
+
+    async def fake_session_revoked():
+        return False
+
+    monkeypatch.setattr(commands, "collect_status", fake_collect_status)
+    monkeypatch.setattr(commands, "get_mtproto_state", fake_mtproto_state)
+    monkeypatch.setattr(commands, "session_revoked", fake_session_revoked)
+
+    router_names = [router.name for router in bot_dispatcher.sub_routers]
+    assert router_names[-1] == "text_transform"
+    assert router_names.index("check") < router_names.index("text_transform")
+    assert router_names.index("auth_commands") < router_names.index("text_transform")
+
+    bot = RecordingBot()
+    analysis = StubAnalysis()
+    original_analysis = bot_dispatcher.workflow_data["analysis"]
+    bot_dispatcher.workflow_data["analysis"] = analysis
+    update_id = 10_000
+
+    async def feed(
+        text: str,
+        chat_id: int,
+        chat_type: ChatType = ChatType.PRIVATE,
+    ) -> list[str]:
+        nonlocal update_id
+        update_id += 1
+        first_token = text.split(maxsplit=1)[0] if text.split() else ""
+        entities = None
+        if first_token.startswith("/"):
+            entities = [
+                MessageEntity(
+                    type=MessageEntityType.BOT_COMMAND,
+                    offset=0,
+                    length=len(first_token),
+                )
+            ]
+        update = Update(
+            update_id=update_id,
+            message=Message(
+                message_id=update_id,
+                date=datetime.now(UTC),
+                chat=Chat(id=chat_id, type=chat_type),
+                from_user=User(id=111, is_bot=False, first_name="Admin"),
+                text=text,
+                entities=entities,
+            ),
+        )
+        before = len(bot.texts)
+        await bot_dispatcher.feed_update(bot, update)
+        return bot.texts[before:]
+
+    try:
+        expected_command_responses = {
+            "/start": "Welcome to the Telegram Message Analyzer.",
+            "/status": "🖥 System status",
+            "/help": "Telegram Message Analyzer",
+            "/check": "Send the message you want me to analyze.",
+            "/settings": "⚙️ Analysis settings",
+            "/authstatus": "🔐 MTProto status",
+            "/listchats": "You have no configured chats.",
+        }
+        check_chat_id = 20_004
+        for index, (command, expected) in enumerate(expected_command_responses.items()):
+            chat_id = check_chat_id if command == "/check" else 20_000 + index
+            responses = await feed(command, chat_id)
+            assert len(responses) == 1
+            assert expected in responses[0]
+
+        ordinary = (
+            "Anyone providing Apple Pay GPT accounts with full warranty, "
+            "please reply or DM me."
+        )
+        responses = await feed(ordinary, 21_000)
+        assert responses == [
+            "AnyoneProvidingApplePayGPTaccountsWithFullWarranty,PleaseReplyOrDMme."
+        ]
+        assert bot.parse_modes[-1] is None
+        assert await feed("Group text stays untouched", -21_001, ChatType.GROUP) == []
+
+        draft = "This /check draft keeps its original spaces."
+        responses = await feed(draft, check_chat_id)
+        assert responses == [
+            "🧠 Analysis queued. Request `test-request`.\n"
+            "The result will appear here shortly."
+        ]
+        assert analysis.submissions == [(draft, 111)]
+    finally:
+        bot_dispatcher.workflow_data["analysis"] = original_analysis
+        await bot.session.close()
+
+
 async def test_bot_analysis_service_runs_without_gateway(db):
     """Bot submits with NO MTProto gateway; no inline execution happens."""
     service = AnalysisService()
@@ -358,7 +508,7 @@ async def test_worker_add_chat_job_resolves_via_gateway(db, fake_gateway, monkey
     assert result["chat_id"] == CHAT_ID
 
     chat_service = ChatService()
-    chat = await chat_service.get_chat(CHAT_ID)
+    chat = await chat_service.get_chat(CHAT_ID, user_id=111)
     assert chat is not None
     assert chat.username == "publicgroup"
     assert chat.access_state == AccessState.ACCESSIBLE.value

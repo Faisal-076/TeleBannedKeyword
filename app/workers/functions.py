@@ -202,7 +202,7 @@ async def add_chat(ctx: dict, reference: str, actor: str) -> dict:
         await _notify_user(actor, f"❌ Cannot add chat: {error}")
         return {"ok": False, "error": resolved.error}
 
-    result = await _get_chat_service().persist_resolved(resolved, actor=actor)
+    result = await _get_chat_service().persist_resolved(resolved, actor=actor, owner_user_id=int(actor))
     if not result.ok or result.chat is None:
         await _notify_user(actor, f"❌ Cannot add chat: {result.error}")
         return {"ok": False, "error": result.error}

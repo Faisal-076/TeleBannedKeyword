@@ -1,9 +1,7 @@
-"""Target chat management (database-only).
+"""Target chat management, user-scoped via user_chat_targets.
 
-MTProto resolution happens ONLY in the worker process (jobs `add_chat` /
-`check_chat` in app/workers/functions.py). The bot and the admin API never
-open an MTProto session — they queue work and persist what the worker
-resolves. Inaccessible private groups are rejected with a clear reason.
+MTProto resolution happens ONLY in the worker process.  Every user sees
+ONLY their own configured chats.
 """
 
 from __future__ import annotations
@@ -12,9 +10,16 @@ import logging
 from dataclasses import dataclass
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.database.engine import session_scope
-from app.database.models import AuditEvent, TargetChat
+from app.database.models import (
+    AccessMode,
+    AuditEvent,
+    TargetChat,
+    TelegramAccessIdentity,
+    UserChatTarget,
+)
 from app.security.redact import mask_username
 from app.telegram.errors import AccessState
 from app.telegram.gateway import ResolvedChat
@@ -27,50 +32,32 @@ logger = logging.getLogger("app.services.chats")
 class AddChatResult:
     ok: bool
     chat: TargetChat | None = None
+    target: UserChatTarget | None = None
     error: str | None = None
     access_state: str | None = None
 
 
 class ChatService:
-    """Database-only chat management; never touches MTProto.
+    """Database-only chat management; never touches MTProto."""
 
-    Resolution/verification happens in the worker (`add_chat` / `check_chat`
-    jobs); this service only persists what the worker resolved.
-    """
-
-    async def persist_resolved(self, resolved: ResolvedChat, actor: str) -> AddChatResult:
-        """Persist a chat that the worker already resolved via MTProto."""
+    async def persist_resolved(
+        self, resolved: ResolvedChat, actor: str, *, owner_user_id: int
+    ) -> AddChatResult:
         if resolved.access_state != AccessState.ACCESSIBLE:
-            message = {
-                AccessState.USERNAME_NOT_FOUND.value: "username not found",
-                AccessState.PRIVATE_NO_ACCESS.value: (
-                    "private chat — the scanner account is not a member"
-                ),
-                AccessState.NOT_MEMBER.value: "scanner account is not a member",
-                AccessState.BANNED.value: "scanner account is banned in this chat",
-                AccessState.RESTRICTED.value: "scanner account is restricted",
-                AccessState.DELETED.value: "chat no longer exists",
-                AccessState.MIGRATED.value: "chat was migrated; resolve the new chat",
-                AccessState.INSUFFICIENT_PERMISSIONS.value: "insufficient permissions",
-                AccessState.INVALID_INVITE.value: "invite link invalid or expired",
-            }.get(resolved.error or "", resolved.error or "unreachable")
-            return AddChatResult(ok=False, error=message, access_state=resolved.error)
+            return AddChatResult(ok=False, error=resolved.error or "unreachable", access_state=resolved.error)
 
         async with session_scope() as session:
-            existing = await session.execute(
+            chat = await session.execute(
                 select(TargetChat).where(TargetChat.telegram_chat_id == resolved.chat_id)
             )
-            chat = existing.scalar_one_or_none()
+            chat = chat.scalar_one_or_none()
             if chat is None:
-                chat = TargetChat(
-                    telegram_chat_id=resolved.chat_id,
-                    title=resolved.title,
-                    username=resolved.username,
-                    chat_type=resolved.chat_type,
-                    access_state=AccessState.ACCESSIBLE.value,
-                    last_verified_at=utc_now_naive(),
-                )
+                chat = TargetChat(telegram_chat_id=resolved.chat_id, title=resolved.title,
+                                  username=resolved.username if resolved.username else None,
+                                  chat_type=resolved.chat_type, access_state=AccessState.ACCESSIBLE.value,
+                                  last_verified_at=utc_now_naive())
                 session.add(chat)
+                await session.flush()
             else:
                 chat.title = resolved.title
                 chat.username = resolved.username
@@ -78,76 +65,102 @@ class ChatService:
                 chat.access_state = AccessState.ACCESSIBLE.value
                 chat.access_error = None
                 chat.last_verified_at = utc_now_naive()
-            await session.flush()
-            session.add(
-                AuditEvent(
-                    user_id_hash=actor,
-                    operation="chat_add",
-                    status="ok",
-                    details={"chat_id": resolved.chat_id},
-                )
+
+            stmt = pg_insert(UserChatTarget).values(
+                user_id=owner_user_id, telegram_chat_id=resolved.chat_id,
+                enabled=True, access_mode=AccessMode.CENTRAL_PUBLIC.value,
+            ).on_conflict_do_update(
+                index_elements=["user_id", "telegram_chat_id"],
+                set_={"enabled": True, "access_mode": AccessMode.CENTRAL_PUBLIC.value},
             )
+            await session.execute(stmt)
+
+            session.add(AuditEvent(
+                user_id_hash=actor, operation="chat_add", status="ok",
+                details={"chat_id": resolved.chat_id, "owner_user_id": owner_user_id},
+            ))
             return AddChatResult(ok=True, chat=chat)
 
-    async def apply_chat_info(self, chat: TargetChat, info: ResolvedChat) -> dict:
-        """Persist a fresh access-state/verification result (worker-written)."""
-        ok = info.access_state == AccessState.ACCESSIBLE
-        async with session_scope() as session:
-            row = await session.get(TargetChat, chat.id)
-            if row is not None:
-                row.access_state = info.access_state.value
-                row.access_error = None if ok else info.error
-                row.last_verified_at = utc_now_naive()
-                if info.title:
-                    row.title = info.title
-        return {
-            "chat_id": chat.telegram_chat_id,
-            "title": info.title or chat.title,
-            "username": mask_username(info.username or chat.username),
-            "access_state": info.access_state.value,
-            "ok": ok,
-        }
-
-    async def remove_chat(self, chat_id: int) -> bool:
+    async def remove_chat(self, chat_id: int, *, user_id: int) -> bool:
         async with session_scope() as session:
             result = await session.execute(
-                select(TargetChat).where(TargetChat.telegram_chat_id == chat_id)
+                select(UserChatTarget).where(
+                    UserChatTarget.user_id == user_id, UserChatTarget.telegram_chat_id == chat_id)
             )
-            chat = result.scalar_one_or_none()
-            if chat is None:
+            target = result.scalar_one_or_none()
+            if target is None:
                 return False
-            await session.delete(chat)
-            session.add(
-                AuditEvent(operation="chat_remove", status="ok", details={"chat_id": chat_id})
-            )
+            await session.delete(target)
+            session.add(AuditEvent(
+                operation="chat_remove", status="ok", details={"chat_id": chat_id, "user_id": user_id}))
             return True
 
-    async def list_chats(self) -> list[TargetChat]:
+    async def list_chats(self, user_id: int) -> list[TargetChat]:
+        async with session_scope() as session:
+            result = await session.execute(
+                select(TargetChat).join(
+                    UserChatTarget, TargetChat.telegram_chat_id == UserChatTarget.telegram_chat_id
+                ).where(UserChatTarget.user_id == user_id).order_by(UserChatTarget.id)
+            )
+            return list(result.scalars().all())
+
+    async def admin_list_chats(self) -> list[TargetChat]:
+        """Root-admin global view — returns all chats regardless of owner."""
         async with session_scope() as session:
             result = await session.execute(select(TargetChat).order_by(TargetChat.id))
             return list(result.scalars().all())
 
-    async def get_chat(self, chat_id: int) -> TargetChat | None:
+    async def admin_remove_chat(self, chat_id: int) -> bool:
+        """Root-admin remove — deletes the TargetChat + all UserChatTarget rows."""
+        async with session_scope() as session:
+            from sqlalchemy import delete
+            await session.execute(
+                delete(UserChatTarget).where(UserChatTarget.telegram_chat_id == chat_id)
+            )
+            chat = await session.execute(select(TargetChat).where(TargetChat.telegram_chat_id == chat_id))
+            chat = chat.scalar_one_or_none()
+            if chat is None:
+                return False
+            await session.delete(chat)
+            return True
         async with session_scope() as session:
             result = await session.execute(
-                select(TargetChat).where(TargetChat.telegram_chat_id == chat_id)
+                select(UserChatTarget).where(UserChatTarget.user_id == user_id).order_by(UserChatTarget.id)
+            )
+            return list(result.scalars().all())
+
+    async def get_user_target(self, user_id: int, chat_id: int) -> UserChatTarget | None:
+        async with session_scope() as session:
+            result = await session.execute(
+                select(UserChatTarget).where(
+                    UserChatTarget.user_id == user_id, UserChatTarget.telegram_chat_id == chat_id)
             )
             return result.scalar_one_or_none()
 
-    async def set_enabled(self, chat_id: int, enabled: bool) -> TargetChat | None:
+    async def get_chat(self, chat_id: int, *, user_id: int) -> TargetChat | None:
         async with session_scope() as session:
             result = await session.execute(
-                select(TargetChat).where(TargetChat.telegram_chat_id == chat_id)
-            )
-            chat = result.scalar_one_or_none()
-            if chat is None:
-                return None
-            chat.enabled = enabled
-            session.add(
-                AuditEvent(
-                    operation="chat_set_enabled",
-                    status="ok",
-                    details={"chat_id": chat_id, "enabled": enabled},
+                select(TargetChat).join(
+                    UserChatTarget, TargetChat.telegram_chat_id == UserChatTarget.telegram_chat_id
+                ).where(
+                    UserChatTarget.user_id == user_id,
+                    TargetChat.telegram_chat_id == chat_id,
                 )
             )
-            return chat
+            return result.scalar_one_or_none()
+
+    async def set_enabled(self, chat_id: int, enabled: bool, *, user_id: int) -> TargetChat | None:
+        async with session_scope() as session:
+            target = await session.execute(
+                select(UserChatTarget).where(
+                    UserChatTarget.user_id == user_id, UserChatTarget.telegram_chat_id == chat_id)
+            )
+            target = target.scalar_one_or_none()
+            if target is None:
+                return None
+            target.enabled = enabled
+            session.add(AuditEvent(
+                operation="chat_set_enabled", status="ok",
+                details={"chat_id": chat_id, "enabled": enabled, "user_id": user_id}))
+            chat = await session.execute(select(TargetChat).where(TargetChat.telegram_chat_id == chat_id))
+            return chat.scalar_one_or_none()

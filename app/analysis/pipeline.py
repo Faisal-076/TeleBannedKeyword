@@ -73,9 +73,9 @@ class AnalysisPipeline:
         self._deps = deps
         self._settings = get_settings()
 
-    async def analyze(self, request_text: str) -> AnalysisOutcome:
+    async def analyze(self, request_text: str, *, user_id: int = 0) -> AnalysisOutcome:
         doc = normalize_document(request_text)
-        chats = await self._enabled_chats()
+        chats = await self._enabled_chats(user_id)
         outcome = AnalysisOutcome(
             request_id="",
             original_text=request_text,
@@ -122,10 +122,14 @@ class AnalysisPipeline:
 
     # ------------------------------------------------------------------ internals
 
-    async def _enabled_chats(self) -> list[TargetChat]:
+    async def _enabled_chats(self, user_id: int) -> list[TargetChat]:
+        from app.database.models import UserChatTarget
         async with session_scope() as session:
             result = await session.execute(
-                select(TargetChat).where(TargetChat.enabled.is_(True)).order_by(TargetChat.id)
+                select(TargetChat)
+                .join(UserChatTarget, TargetChat.telegram_chat_id == UserChatTarget.telegram_chat_id)
+                .where(UserChatTarget.user_id == user_id, UserChatTarget.enabled.is_(True))
+                .order_by(TargetChat.id)
             )
             return list(result.scalars().all())
 

@@ -138,7 +138,7 @@ class AnalysisService:
             PipelineDeps(gateway=self._gateway, searcher=searcher, llm=llm)
         )
         try:
-            outcome = await pipeline.analyze(original)
+            outcome = await pipeline.analyze(original, user_id=user_id)
             outcome.request_id = request_id
             storage = outcome.to_storage()
             async with session_scope() as session:
