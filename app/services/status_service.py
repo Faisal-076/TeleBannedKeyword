@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from datetime import UTC, datetime
+from datetime import datetime
 
 from sqlalchemy import func, select
 
@@ -28,10 +28,10 @@ HEARTBEAT_WORKER_KEY = "tbk:heartbeat:worker"
 MT_PROTO_STATE_KEY = "tbk:mtproto:state"
 
 
-def _heartbeat_age(redis, key: str, max_age: int = 120) -> float | None:
+async def _heartbeat_age(redis, key: str, max_age: int = 120) -> float | None:
     """Return age in seconds of a heartbeat key, or None if absent."""
     try:
-        raw = redis.get(key)
+        raw = await redis.get(key)
         if not raw:
             return None
         ts = float(raw)
@@ -134,8 +134,8 @@ async def collect_status(
 
         redis = redis_from_url(settings.redis_url, decode_responses=True)
         try:
-            status["worker_heartbeat_age"] = _heartbeat_age(redis, HEARTBEAT_WORKER_KEY)
-            status["bot_heartbeat_age"] = _heartbeat_age(redis, HEARTBEAT_BOT_KEY)
+            status["worker_heartbeat_age"] = await _heartbeat_age(redis, HEARTBEAT_WORKER_KEY)
+            status["bot_heartbeat_age"] = await _heartbeat_age(redis, HEARTBEAT_BOT_KEY)
         finally:
             await redis.aclose()
     try:
